@@ -1,0 +1,119 @@
+[package]
+name = "rp2350-sim800l"
+version = "0.1.0"
+edition = "2024"
+description = "Embassy application for Waveshare RP2350-Plus + SIM800L: AT setup via atat, IP via embassy-net-ppp"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/serdzz/rp2350-sim800l-ppp"
+# Хостовые тесты AT-слоя — отдельный крейт, см. run-at-tests.sh
+exclude = ["at-tests"]
+
+# ---------------------------------------------------------------------------
+# Бэкенды логирования
+#
+# Ровно один из log-rtt / log-usb должен быть включён. Макросы info!/warn!/...
+# определены в src/fmt.rs и разворачиваются либо в defmt, либо в log.
+#
+#   cargo run   --release                                  # defmt по RTT
+#   cargo build --release --no-default-features -F log-usb # текст по USB CDC
+# ---------------------------------------------------------------------------
+[features]
+default = ["log-rtt"]
+
+## defmt поверх RTT — нужен отладчик (probe-rs), даёт паники с бэктрейсом.
+log-rtt = ["_defmt", "dep:defmt-rtt", "panic-probe/print-defmt"]
+
+## Текстовый лог поверх USB CDC-ACM — читается любым serial-терминалом.
+log-usb = ["_log", "dep:embassy-usb", "dep:embassy-usb-logger"]
+
+## Внутренние: переключают формат сообщений во всём дереве зависимостей.
+## Напрямую включать не нужно.
+_defmt = [
+    "dep:defmt",
+    "embassy-rp/defmt",
+    "embassy-executor/defmt",
+    "embassy-time/defmt",
+    "embassy-time/defmt-timestamp-uptime",
+    "embassy-sync/defmt",
+    "embassy-futures/defmt",
+    "embassy-net/defmt",
+    "embassy-net-ppp/defmt",
+    "atat/defmt",
+    "embedded-io/defmt",
+]
+_log = [
+    "dep:log",
+    "embassy-rp/log",
+    "embassy-executor/log",
+    "embassy-time/log",
+    "embassy-futures/log",
+    "embassy-net/log",
+    "embassy-net-ppp/log",
+    # NOTE: у atat 0.24 нет feature `log` — в этом режиме его внутренние
+    # сообщения молчат. Логи самого приложения не страдают.
+]
+
+[dependencies]
+# --- HAL / RTOS ---
+embassy-rp = { version = "0.10", features = [
+    "rp235xa",
+    "time-driver",
+    "critical-section-impl",
+    "unstable-pac",
+] }
+embassy-executor = { version = "0.10", features = [
+    "platform-cortex-m",
+    "executor-thread",
+] }
+embassy-time = "0.5"
+embassy-sync = "0.8"
+embassy-futures = "0.1"
+
+# --- Networking ---
+# medium-ip: PPP is a point-to-point link, there is no link-layer address.
+embassy-net = { version = "0.9", features = [
+    "proto-ipv4",
+    "medium-ip",
+    "tcp",
+    "udp",
+    "dns",
+] }
+embassy-net-ppp = "0.3"
+
+# --- AT command layer ---
+# NOTE: atat pulls heapless 0.8; embassy-net pulls heapless 0.9. AT command and
+# response types must use `atat::heapless` (0.8) — see src/modem.rs.
+atat = { version = "0.24", features = ["derive", "heapless"] }
+
+# --- Logging backends (по одному на сборку, см. [features]) ---
+defmt = { version = "1", optional = true }
+defmt-rtt = { version = "1", optional = true }
+log = { version = "0.4", optional = true, default-features = false }
+embassy-usb = { version = "0.6", optional = true }
+embassy-usb-logger = { version = "0.6", optional = true }
+# panic-probe без print-defmt просто выполняет udf — работает в обоих режимах.
+panic-probe = "1"
+
+# --- Misc ---
+embedded-io-async = "0.7"
+heapless = "0.9"
+static_cell = "2"
+portable-atomic = { version = "1", features = ["critical-section"] }
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+cortex-m-rt = "0.7"
+embedded-io = "0.7"
+embedded-io-06 = { version = "0.6", package = "embedded-io" }
+embedded-io-async-06 = { version = "0.6", package = "embedded-io-async" }
+
+[profile.release]
+debug = 2
+lto = "fat"
+opt-level = "s"
+codegen-units = 1
+
+[profile.dev]
+debug = 2
+opt-level = 1
+# The PPP/atat paths are unusable at opt-level 0 in dependencies.
+[profile.dev.package."*"]
+opt-level = "s"

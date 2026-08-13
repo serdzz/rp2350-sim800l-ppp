@@ -1,0 +1,16 @@
+[package]
+name = "at-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Отдельный крейт, потому что основной собирается только под thumbv8m,
+# а эти тесты должны идти на хосте. `src/modem.rs` подключается через
+# #[path], так что проверяется ровно тот код, что уходит в прошивку.
+#
+# Feature `_defmt` здесь намеренно не объявлен: без него `#[cfg_attr]` в
+# modem.rs не разворачивает derive(defmt::Format), и на хосте не нужен
+# global_logger.
+
+[dependencies]
+atat = { version = "0.24", features = ["derive", "heapless", "std"] }

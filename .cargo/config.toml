@@ -1,0 +1,15 @@
+[target.'cfg(all(target_arch = "arm", target_os = "none"))']
+# Прошивка + defmt-лог через отладчик (Picoprobe / Debug Probe / CMSIS-DAP):
+runner = "probe-rs run --chip RP235x"
+# Альтернатива — прошивка по USB в режиме BOOTSEL (defmt-логов не будет):
+# runner = "picotool load -u -v -x -t elf"
+
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[env]
+DEFMT_LOG = "debug"
+
+[alias]
+# Сборка с логом по USB CDC вместо defmt/RTT — отладчик не нужен.
+build-usb = "build --release --no-default-features --features log-usb"
