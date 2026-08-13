@@ -47,7 +47,9 @@ async fn run_once(
         .dns_query(config::DEMO_HOST, DnsQueryType::A)
         .await
         .map_err(|e| warn!("NET: DNS не ответил: {:?}", e))?;
-    let addr = *addrs.first().ok_or_else(|| warn!("NET: пустой DNS-ответ"))?;
+    let addr = *addrs
+        .first()
+        .ok_or_else(|| warn!("NET: пустой DNS-ответ"))?;
     info!("NET: {} -> {}", config::DEMO_HOST, addr);
 
     let mut socket = TcpSocket::new(stack, rx_buffer, tx_buffer);

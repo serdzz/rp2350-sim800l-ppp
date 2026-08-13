@@ -1,8 +1,8 @@
 //! Управление модулем SIM800L: питание, последовательность AT-инициализации,
 //! вход и выход из PPP (data) режима.
 
-use atat::asynch::AtatClient;
 use atat::Error as AtError;
+use atat::asynch::AtatClient;
 use embassy_rp::gpio::Output;
 use embassy_time::{Duration, Timer};
 use embedded_io_async::Write;

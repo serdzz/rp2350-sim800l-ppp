@@ -80,11 +80,7 @@ macro_rules! unwrap {
         match $crate::fmt::Try::into_result($e) {
             ::core::result::Result::Ok(value) => value,
             ::core::result::Result::Err(_) => {
-                $crate::fmt::unwrap_failed(::core::concat!(
-                    ::core::file!(),
-                    ":",
-                    ::core::line!()
-                ))
+                $crate::fmt::unwrap_failed(::core::concat!(::core::file!(), ":", ::core::line!()))
             }
         }
     };

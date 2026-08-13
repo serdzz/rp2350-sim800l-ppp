@@ -23,8 +23,8 @@ use embassy_rp::usb::{Driver, InterruptHandler};
 use embassy_time::Instant;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::{Builder, Config};
-use embassy_usb_logger::{DummyHandler, UsbLogger, Writer, MAX_PACKET_SIZE};
-use log::{LevelFilter, Level, Record};
+use embassy_usb_logger::{DummyHandler, MAX_PACKET_SIZE, UsbLogger, Writer};
+use log::{Level, LevelFilter, Record};
 use static_cell::StaticCell;
 
 /// Размер кольцевого буфера сообщений.

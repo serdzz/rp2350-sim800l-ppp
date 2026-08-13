@@ -10,6 +10,10 @@
 #[path = "../../src/modem.rs"]
 pub mod modem;
 
+/// Кривая заряда Li-Po — тоже ровно тот файл, что уходит в прошивку.
+#[path = "../../src/lipo.rs"]
+pub mod lipo;
+
 #[cfg(test)]
 mod tests {
     use super::modem::*;

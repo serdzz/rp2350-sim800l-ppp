@@ -23,8 +23,10 @@
 mod fmt;
 
 mod app;
+mod battery;
 mod config;
 mod io_compat;
+mod lipo;
 mod modem;
 mod sim800l;
 #[cfg(feature = "log-usb")]
@@ -33,19 +35,22 @@ mod usb_logger;
 use atat::asynch::Client;
 use atat::{AtatIngress, DefaultDigester, Ingress, ResponseSlot, UrcChannel, UrcSubscription};
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, Either};
+use embassy_futures::select::{Either, select};
 use embassy_net::{Config as NetConfig, ConfigV4, Ipv4Cidr, StackResources, StaticConfigV4};
+use embassy_rp::adc::{
+    Adc, Channel as AdcChannel, Config as AdcConfig, InterruptHandler as AdcInterruptHandler,
+};
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
-use embassy_rp::gpio::{Level, Output};
+use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::peripherals::UART0;
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
 use embassy_time::{Duration, Timer};
 use static_cell::StaticCell;
 
-use panic_probe as _;
 #[cfg(feature = "log-rtt")]
 use defmt_rtt as _;
+use panic_probe as _;
 
 use crate::io_compat::Compat;
 use crate::modem::Urc;
@@ -74,13 +79,12 @@ static URC_CHANNEL: UrcChannel<Urc, URC_CAPACITY, URC_SUBSCRIBERS> = UrcChannel:
 
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
+    ADC_IRQ_FIFO => AdcInterruptHandler;
 });
 
 /// Фоновая задача сетевого стека `embassy-net`.
 #[embassy_executor::task]
-async fn net_task(
-    mut runner: embassy_net::Runner<'static, embassy_net_ppp::Device<'static>>,
-) -> ! {
+async fn net_task(mut runner: embassy_net::Runner<'static, embassy_net_ppp::Device<'static>>) -> ! {
     runner.run().await
 }
 
@@ -90,6 +94,30 @@ async fn urc_task(mut sub: UrcSubscription<'static, Urc, URC_CAPACITY, URC_SUBSC
     loop {
         let urc = sub.next_message_pure().await;
         info!("URC: {:?}", urc);
+    }
+}
+
+/// Периодический замер питания.
+///
+/// GP29 = VSYS/3, GP24 = сенсор VBUS, GP23 = MODE/SYNC у MP28164 —
+/// подробности и ограничения см. в `battery.rs`.
+#[embassy_executor::task]
+async fn battery_task(mut monitor: battery::PowerMonitor<'static>) -> ! {
+    loop {
+        match monitor.read().await {
+            Ok(r) => match (r.vbat_mv, r.percent) {
+                (Some(mv), Some(pct)) => info!(
+                    "PWR: {:?}, батарея {} мВ ({} %), VSYS {} мВ",
+                    r.source, mv, pct, r.vsys_mv
+                ),
+                _ => info!(
+                    "PWR: {:?}, VSYS {} мВ (батарея не измеряется)",
+                    r.source, r.vsys_mv
+                ),
+            },
+            Err(e) => warn!("PWR: ошибка АЦП: {:?}", e),
+        }
+        Timer::after(Duration::from_secs(60)).await;
     }
 }
 
@@ -108,6 +136,16 @@ async fn main(spawner: Spawner) {
     // GP2 -> PWRKEY модуля. Если PWRKEY не разведён (модуль стартует сам),
     // пин просто останется неиспользуемым выходом.
     let mut pwrkey = Output::new(p.PIN_2, Level::High);
+
+    // --- Мониторинг питания -----------------------------------------------
+    // PIN_23/24/29 разведены на плате и на гребёнку не выходят.
+    let monitor = battery::PowerMonitor::new(
+        Adc::new(p.ADC, Irqs, AdcConfig::default()),
+        AdcChannel::new_pin(p.PIN_29, Pull::None),
+        Input::new(p.PIN_24, Pull::None),
+        Output::new(p.PIN_23, Level::Low),
+    );
+    spawner.spawn(unwrap!(battery_task(monitor)));
 
     // --- UART на GP0 (TX) / GP1 (RX) --------------------------------------
     static UART_TX_BUF: StaticCell<[u8; UART_TX_BUF_SIZE]> = StaticCell::new();
@@ -128,7 +166,8 @@ async fn main(spawner: Spawner) {
 
     // --- PPP-драйвер как embassy-net Device -------------------------------
     static PPP_STATE: StaticCell<embassy_net_ppp::State<4, 4>> = StaticCell::new();
-    let (device, mut ppp_runner) = embassy_net_ppp::new(PPP_STATE.init(embassy_net_ppp::State::new()));
+    let (device, mut ppp_runner) =
+        embassy_net_ppp::new(PPP_STATE.init(embassy_net_ppp::State::new()));
 
     // --- Сетевой стек ------------------------------------------------------
     // IP-конфигурацию не задаём: её принесёт IPCP при подъёме PPP.
