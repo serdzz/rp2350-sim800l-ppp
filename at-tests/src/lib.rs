@@ -45,6 +45,16 @@ mod tests {
         assert_eq!(ser(&ShutIpStack), "AT+CIPSHUT\r");
         // Префикс "AT" + "&W", без знака "=" — полей у команды нет.
         assert_eq!(ser(&SaveSettings), "AT&W\r");
+        // basic option, только UIH, 115200 бод, поле данных до 127 байт.
+        assert_eq!(
+            ser(&SetCmuxMode {
+                mode: 0,
+                subset: 0,
+                port_speed: 5,
+                n1: 127
+            }),
+            "AT+CMUX=0,0,5,127\r"
+        );
         assert_eq!(
             ser(&SetPdpContext {
                 cid: 1,

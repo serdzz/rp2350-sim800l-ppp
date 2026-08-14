@@ -136,6 +136,27 @@ pub struct SetBaudRate {
     pub rate: u32,
 }
 
+/// `AT+CMUX=<mode>,<subset>,<port_speed>,<N1>` — перевести линию в
+/// мультиплексный режим 3GPP TS 27.010.
+///
+/// После `OK` обычный AT-обмен по этому UART заканчивается: дальше всё, включая
+/// сами AT-команды, ходит кадрами — см. [`crate::cmux`].
+///
+/// `mode` 0 — basic option, `subset` 0 — только UIH, `port_speed` 5 — 115200
+/// бод (кодировка из 3GPP TS 27.007), `n1` — максимальный размер поля данных.
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+CMUX", NoResponse, timeout_ms = 5_000)]
+pub struct SetCmuxMode {
+    #[at_arg(position = 0)]
+    pub mode: u8,
+    #[at_arg(position = 1)]
+    pub subset: u8,
+    #[at_arg(position = 2)]
+    pub port_speed: u8,
+    #[at_arg(position = 3)]
+    pub n1: u16,
+}
+
 /// `AT&W` — сохранить текущие настройки в профиль модуля.
 ///
 /// Без этого `ATE0` и `AT+IPR` живут только до следующего сброса: при провале

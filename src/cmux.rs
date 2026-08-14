@@ -462,6 +462,338 @@ impl<const N: usize> Decoder<N> {
     }
 }
 
+impl Frame<'static> {
+    /// Кадр без поля данных: SABM, UA, DM, DISC.
+    ///
+    /// `command` соответствует таблице 1: инициатор шлёт команды с C/R = 1 и
+    /// получает ответы с C/R = 0.
+    pub const fn control(dlci: u8, kind: FrameKind, command: bool, poll_final: bool) -> Self {
+        Self {
+            address: Address { dlci, command },
+            kind,
+            poll_final,
+            information: &[],
+        }
+    }
+
+    /// SABM — запрос на открытие канала. P = 1, как требует §5.4.1.
+    pub const fn sabm(dlci: u8) -> Self {
+        Self::control(dlci, FrameKind::Sabm, true, true)
+    }
+
+    /// DISC — запрос на закрытие канала.
+    pub const fn disc(dlci: u8) -> Self {
+        Self::control(dlci, FrameKind::Disc, true, true)
+    }
+
+    /// UA — подтверждение SABM или DISC. Ответ, поэтому C/R = 0, F = 1.
+    pub const fn ua(dlci: u8) -> Self {
+        Self::control(dlci, FrameKind::Ua, false, true)
+    }
+
+    /// DM — «канал закрыт». Ответ, поэтому C/R = 0.
+    pub const fn dm(dlci: u8) -> Self {
+        Self::control(dlci, FrameKind::Dm, false, true)
+    }
+}
+
+impl<'a> Frame<'a> {
+    /// UIH с данными — рабочая лошадка передачи. P/F = 0.
+    pub const fn uih(dlci: u8, information: &'a [u8]) -> Self {
+        Self {
+            address: Address {
+                dlci,
+                command: true,
+            },
+            kind: FrameKind::Uih,
+            poll_final: false,
+            information,
+        }
+    }
+}
+
+/// Сообщения управляющего канала (DLCI 0), §5.4.6.
+///
+/// Формат «тип — длина — значение». В октете типа: бит 1 — EA, бит 2 — C/R,
+/// биты 3..8 — сам тип. Константы ниже хранят именно биты типа, без EA и C/R.
+pub mod control {
+    /// Multiplexer close down — вернуть линию в обычный AT-режим (§5.4.6.3.3).
+    pub const CLD: u8 = 0x30;
+    /// Modem Status Command — передача виртуальных сигналов V.24 (§5.4.6.3.7).
+    ///
+    /// Спецификация требует слать его до любых пользовательских данных сразу
+    /// после создания канала.
+    pub const MSC: u8 = 0x38;
+
+    /// Собрать октет типа из битов типа и признака команды.
+    pub const fn type_octet(bits: u8, command: bool) -> u8 {
+        (bits << 2) | ((command as u8) << 1) | 1
+    }
+
+    /// Не хватило места в выходном буфере либо значение длиннее 127 октетов.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct EncodeError;
+
+    /// Сериализовать сообщение «тип — длина — значение».
+    ///
+    /// Многооктетные типы и длины спецификацией предусмотрены, но ни один
+    /// определённый в ней тип их не использует, поэтому здесь только
+    /// однооктетный вариант.
+    pub fn encode(
+        bits: u8,
+        command: bool,
+        value: &[u8],
+        out: &mut [u8],
+    ) -> Result<usize, EncodeError> {
+        if value.len() > 127 || out.len() < value.len() + 2 {
+            return Err(EncodeError);
+        }
+        out[0] = type_octet(bits, command);
+        out[1] = ((value.len() as u8) << 1) | 1;
+        out[2..2 + value.len()].copy_from_slice(value);
+        Ok(value.len() + 2)
+    }
+
+    /// Разобрать сообщение: биты типа, признак команды и значение.
+    ///
+    /// `None`, если буфер обрывается или у типа либо длины сброшен бит EA —
+    /// многооктетные поля мы не поддерживаем.
+    pub fn decode(buf: &[u8]) -> Option<(u8, bool, &[u8])> {
+        let &[type_octet, length_octet, ref rest @ ..] = buf else {
+            return None;
+        };
+        if type_octet & 1 == 0 || length_octet & 1 == 0 {
+            return None;
+        }
+        let len = (length_octet >> 1) as usize;
+        let value = rest.get(..len)?;
+        Some((type_octet >> 2, type_octet & 0b10 != 0, value))
+    }
+
+    /// Октет виртуальных сигналов V.24 (§5.4.6.3.7, рисунок 10).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct V24Signals {
+        /// FC: устройство не может принимать кадры.
+        pub flow_control: bool,
+        /// RTC: устройство готово к обмену.
+        pub ready_to_communicate: bool,
+        /// RTR: устройство готово принимать данные.
+        pub ready_to_receive: bool,
+        /// IC: входящий вызов. По таблице 7 передающий DTE всегда шлёт 0.
+        pub incoming_call: bool,
+        /// DV: передаются достоверные данные. У DTE всегда 1.
+        pub data_valid: bool,
+    }
+
+    impl V24Signals {
+        /// Нормальное состояние DTE: готовы к обмену и приёму, потока не
+        /// стопорим. Кодируется в `0x8D`.
+        pub const DTE_READY: Self = Self {
+            flow_control: false,
+            ready_to_communicate: true,
+            ready_to_receive: true,
+            incoming_call: false,
+            data_valid: true,
+        };
+
+        pub const fn encode(self) -> u8 {
+            // Бит 1 — EA, биты 5 и 6 зарезервированы и передаются нулями.
+            1 | ((self.flow_control as u8) << 1)
+                | ((self.ready_to_communicate as u8) << 2)
+                | ((self.ready_to_receive as u8) << 3)
+                | ((self.incoming_call as u8) << 6)
+                | ((self.data_valid as u8) << 7)
+        }
+
+        /// `None`, если сброшен бит EA.
+        pub fn decode(octet: u8) -> Option<Self> {
+            if octet & 1 == 0 {
+                return None;
+            }
+            Some(Self {
+                flow_control: octet & (1 << 1) != 0,
+                ready_to_communicate: octet & (1 << 2) != 0,
+                ready_to_receive: octet & (1 << 3) != 0,
+                incoming_call: octet & (1 << 6) != 0,
+                data_valid: octet & (1 << 7) != 0,
+            })
+        }
+    }
+
+    /// Собрать MSC для канала `dlci`.
+    ///
+    /// Значение — октет DLCI плюс октет сигналов. В октете DLCI бит 2 всегда
+    /// равен единице, бит 1 — EA.
+    pub fn msc(
+        dlci: u8,
+        signals: V24Signals,
+        command: bool,
+        out: &mut [u8],
+    ) -> Result<usize, EncodeError> {
+        let value = [(dlci << 2) | 0b11, signals.encode()];
+        encode(MSC, command, &value, out)
+    }
+}
+
+/// Состояние логического канала.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelState {
+    Closed,
+    /// Отправлен SABM, ждём UA.
+    Opening,
+    Open,
+    /// Отправлен DISC, ждём UA.
+    Closing,
+}
+
+/// Почему не удалось начать операцию над каналом.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionError {
+    /// DLCI больше 63.
+    DlciOutOfRange,
+    /// Канал уже в этом состоянии либо занят встречной операцией.
+    WrongState(ChannelState),
+}
+
+/// Что произошло при получении кадра.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event<'a> {
+    /// Кадр не потребовал действий.
+    Ignored,
+    /// Канал открыт: пришёл UA на наш SABM.
+    Opened(u8),
+    /// Канал закрыт: UA на наш DISC либо DM от модема.
+    Closed(u8),
+    /// Модем закрывает канал. Отправьте `reply`.
+    RemoteDisconnect { dlci: u8, reply: Frame<'static> },
+    /// Модем открывает канал по своей инициативе. Отправьте `reply`.
+    RemoteOpen { dlci: u8, reply: Frame<'static> },
+    /// Данные канала. Для DLCI 0 это сообщение управляющего канала.
+    Data { dlci: u8, payload: &'a [u8] },
+}
+
+/// Состояние мультиплексора: кто из каналов открыт.
+///
+/// Ввода-вывода не делает — только переводит состояния и подсказывает, какой
+/// кадр отправить. За счёт этого проверяется на хосте целиком.
+pub struct Session {
+    channels: [ChannelState; 64],
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Session {
+    pub const fn new() -> Self {
+        Self {
+            channels: [ChannelState::Closed; 64],
+        }
+    }
+
+    pub fn state(&self, dlci: u8) -> ChannelState {
+        self.channels
+            .get(dlci as usize)
+            .copied()
+            .unwrap_or(ChannelState::Closed)
+    }
+
+    /// Кадр SABM для открытия канала. Канал переходит в [`ChannelState::Opening`].
+    ///
+    /// Первым надо открывать DLCI 0 — управляющий канал (§5.4.6).
+    pub fn open(&mut self, dlci: u8) -> Result<Frame<'static>, SessionError> {
+        self.expect(dlci, ChannelState::Closed)?;
+        self.channels[dlci as usize] = ChannelState::Opening;
+        Ok(Frame::sabm(dlci))
+    }
+
+    /// Кадр DISC для закрытия канала.
+    pub fn close(&mut self, dlci: u8) -> Result<Frame<'static>, SessionError> {
+        self.expect(dlci, ChannelState::Open)?;
+        self.channels[dlci as usize] = ChannelState::Closing;
+        Ok(Frame::disc(dlci))
+    }
+
+    fn expect(&self, dlci: u8, want: ChannelState) -> Result<(), SessionError> {
+        if dlci > 0x3F {
+            return Err(SessionError::DlciOutOfRange);
+        }
+        let have = self.channels[dlci as usize];
+        if have == want {
+            Ok(())
+        } else {
+            Err(SessionError::WrongState(have))
+        }
+    }
+
+    /// Обработать принятый кадр.
+    ///
+    /// Бит C/R намеренно не проверяется: модемы расставляют его вольно, а
+    /// принадлежность кадра однозначно задаётся DLCI и типом.
+    pub fn on_frame<'a>(&mut self, frame: &Frame<'a>) -> Event<'a> {
+        let dlci = frame.address.dlci;
+        if dlci as usize >= self.channels.len() {
+            return Event::Ignored;
+        }
+        let state = self.channels[dlci as usize];
+
+        match frame.kind {
+            FrameKind::Ua => match state {
+                ChannelState::Opening => {
+                    self.channels[dlci as usize] = ChannelState::Open;
+                    Event::Opened(dlci)
+                }
+                ChannelState::Closing => {
+                    self.channels[dlci as usize] = ChannelState::Closed;
+                    Event::Closed(dlci)
+                }
+                _ => Event::Ignored,
+            },
+
+            // DM — отказ в открытии либо сообщение, что канал уже закрыт.
+            FrameKind::Dm => match state {
+                ChannelState::Opening | ChannelState::Closing | ChannelState::Open => {
+                    self.channels[dlci as usize] = ChannelState::Closed;
+                    Event::Closed(dlci)
+                }
+                ChannelState::Closed => Event::Ignored,
+            },
+
+            FrameKind::Disc => {
+                if state == ChannelState::Closed {
+                    // §5.3.3: на DISC в закрытом состоянии отвечаем DM.
+                    Event::RemoteDisconnect {
+                        dlci,
+                        reply: Frame::dm(dlci),
+                    }
+                } else {
+                    self.channels[dlci as usize] = ChannelState::Closed;
+                    Event::RemoteDisconnect {
+                        dlci,
+                        reply: Frame::ua(dlci),
+                    }
+                }
+            }
+
+            // Модем открывает канал по своей инициативе.
+            FrameKind::Sabm => {
+                self.channels[dlci as usize] = ChannelState::Open;
+                Event::RemoteOpen {
+                    dlci,
+                    reply: Frame::ua(dlci),
+                }
+            }
+
+            FrameKind::Uih | FrameKind::Ui => Event::Data {
+                dlci,
+                payload: frame.information,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -851,6 +1183,216 @@ mod tests {
         let out = feed(&mut d, &bytes);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].clone().unwrap().3, payload);
+    }
+
+    /// Конструкторы служебных кадров должны давать ровно те байты, которых
+    /// ждёт модем: SABM с P = 1, ответы с C/R = 0.
+    #[test]
+    fn control_frame_constructors() {
+        assert_eq!(
+            encode(&Frame::sabm(0)),
+            vec![0xF9, 0x03, 0x3F, 0x01, 0x1C, 0xF9]
+        );
+
+        for f in [Frame::ua(1), Frame::dm(1)] {
+            assert!(!f.address.command, "ответ шлётся с C/R = 0");
+            assert!(f.poll_final, "у ответа бит F взведён");
+        }
+        for f in [Frame::sabm(1), Frame::disc(1)] {
+            assert!(f.address.command, "команда шлётся с C/R = 1");
+            assert!(f.poll_final, "у команды бит P взведён");
+        }
+        assert!(!Frame::uih(1, b"x").poll_final, "у UIH P/F не взводится");
+    }
+
+    /// Штатная последовательность: открыть управляющий канал, затем данные.
+    #[test]
+    fn opens_control_channel_then_data_channel() {
+        let mut s = Session::new();
+        assert_eq!(s.state(0), ChannelState::Closed);
+
+        let sabm = s.open(0).unwrap();
+        assert_eq!(sabm.kind, FrameKind::Sabm);
+        assert_eq!(s.state(0), ChannelState::Opening);
+
+        // Модем подтверждает: UA приходит ответом, то есть с C/R = 0.
+        assert_eq!(s.on_frame(&Frame::ua(0)), Event::Opened(0));
+        assert_eq!(s.state(0), ChannelState::Open);
+
+        s.open(1).unwrap();
+        assert_eq!(s.on_frame(&Frame::ua(1)), Event::Opened(1));
+        assert_eq!(s.state(1), ChannelState::Open);
+
+        // Данные канала доезжают наверх нетронутыми.
+        assert_eq!(
+            s.on_frame(&Frame::uih(1, b"AT+CSQ\r")),
+            Event::Data {
+                dlci: 1,
+                payload: b"AT+CSQ\r"
+            }
+        );
+    }
+
+    /// Отказ в открытии: модем отвечает DM вместо UA.
+    #[test]
+    fn dm_refuses_to_open() {
+        let mut s = Session::new();
+        s.open(2).unwrap();
+        assert_eq!(s.on_frame(&Frame::dm(2)), Event::Closed(2));
+        assert_eq!(s.state(2), ChannelState::Closed);
+        // После отказа канал можно пробовать открыть заново.
+        assert!(s.open(2).is_ok());
+    }
+
+    #[test]
+    fn closes_channel_on_our_initiative() {
+        let mut s = Session::new();
+        s.open(1).unwrap();
+        s.on_frame(&Frame::ua(1));
+
+        let disc = s.close(1).unwrap();
+        assert_eq!(disc.kind, FrameKind::Disc);
+        assert_eq!(s.state(1), ChannelState::Closing);
+        assert_eq!(s.on_frame(&Frame::ua(1)), Event::Closed(1));
+        assert_eq!(s.state(1), ChannelState::Closed);
+    }
+
+    /// Модем закрывает канал сам — отвечаем UA. На DISC уже закрытого канала
+    /// спецификация требует DM (§5.3.3).
+    #[test]
+    fn remote_disconnect_is_answered() {
+        let mut s = Session::new();
+        s.open(1).unwrap();
+        s.on_frame(&Frame::ua(1));
+
+        match s.on_frame(&Frame::control(1, FrameKind::Disc, true, true)) {
+            Event::RemoteDisconnect { dlci, reply } => {
+                assert_eq!(dlci, 1);
+                assert_eq!(reply.kind, FrameKind::Ua);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(s.state(1), ChannelState::Closed);
+
+        match s.on_frame(&Frame::control(1, FrameKind::Disc, true, true)) {
+            Event::RemoteDisconnect { reply, .. } => assert_eq!(reply.kind, FrameKind::Dm),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Модем может открыть канал по своей инициативе.
+    #[test]
+    fn remote_open_is_answered_with_ua() {
+        let mut s = Session::new();
+        match s.on_frame(&Frame::control(3, FrameKind::Sabm, true, true)) {
+            Event::RemoteOpen { dlci, reply } => {
+                assert_eq!(dlci, 3);
+                assert_eq!(reply.kind, FrameKind::Ua);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(s.state(3), ChannelState::Open);
+    }
+
+    #[test]
+    fn rejects_bad_transitions() {
+        let mut s = Session::new();
+        s.open(1).unwrap();
+        // Повторное открытие того же канала.
+        assert_eq!(
+            s.open(1),
+            Err(SessionError::WrongState(ChannelState::Opening))
+        );
+        // Закрытие ещё не открытого.
+        assert_eq!(
+            s.close(1),
+            Err(SessionError::WrongState(ChannelState::Opening))
+        );
+        assert_eq!(s.open(64), Err(SessionError::DlciOutOfRange));
+
+        // UA по каналу, который мы не открывали, ничего не меняет.
+        let mut s = Session::new();
+        assert_eq!(s.on_frame(&Frame::ua(5)), Event::Ignored);
+        assert_eq!(s.state(5), ChannelState::Closed);
+    }
+
+    /// Октет типа CLD из §5.4.6.3.3: биты 7 и 8 единичные, остальные нули.
+    #[test]
+    fn control_message_type_octets_match_specification() {
+        assert_eq!(control::type_octet(control::CLD, true), 0xC3);
+        assert_eq!(control::type_octet(control::CLD, false), 0xC1);
+        assert_eq!(control::type_octet(control::MSC, true), 0xE3);
+        assert_eq!(control::type_octet(control::MSC, false), 0xE1);
+    }
+
+    #[test]
+    fn control_message_round_trip() {
+        let mut buf = [0u8; 8];
+
+        // CLD без значения.
+        let n = control::encode(control::CLD, true, &[], &mut buf).unwrap();
+        assert_eq!(&buf[..n], &[0xC3, 0x01]);
+        let (bits, command, value) = control::decode(&buf[..n]).unwrap();
+        assert_eq!((bits, command, value), (control::CLD, true, &[][..]));
+
+        // Слишком короткий буфер и слишком длинное значение — ошибка.
+        let mut tiny = [0u8; 1];
+        assert!(control::encode(control::CLD, true, &[], &mut tiny).is_err());
+        let mut big = [0u8; 200];
+        assert!(control::encode(control::MSC, true, &[0u8; 128], &mut big).is_err());
+
+        // Оборванное сообщение не должно разбираться.
+        assert!(control::decode(&[0xE3]).is_none());
+        assert!(control::decode(&[0xE3, 0x05, 0x01]).is_none());
+        // EA = 0 в типе или длине — многооктетные поля не поддерживаем.
+        assert!(control::decode(&[0xE2, 0x01]).is_none());
+        assert!(control::decode(&[0xE3, 0x00]).is_none());
+    }
+
+    /// MSC для канала 1 в нормальном состоянии DTE.
+    #[test]
+    fn msc_encodes_dlci_and_v24_signals() {
+        let mut buf = [0u8; 8];
+        let n = control::msc(1, control::V24Signals::DTE_READY, true, &mut buf).unwrap();
+        assert_eq!(&buf[..n], &[0xE3, 0x05, 0x07, 0x8D]);
+
+        let (bits, command, value) = control::decode(&buf[..n]).unwrap();
+        assert_eq!(bits, control::MSC);
+        assert!(command);
+        assert_eq!(value[0] >> 2, 1, "DLCI в старших битах");
+        assert_eq!(value[0] & 0b11, 0b11, "бит 2 всегда 1, EA = 1");
+        assert_eq!(
+            control::V24Signals::decode(value[1]),
+            Some(control::V24Signals::DTE_READY)
+        );
+    }
+
+    /// Раскладка октета сигналов по рисунку 10 и таблице 7.
+    #[test]
+    fn v24_signal_bits() {
+        use control::V24Signals;
+        assert_eq!(V24Signals::DTE_READY.encode(), 0x8D);
+
+        let only = |f: fn(&mut V24Signals)| {
+            let mut s = V24Signals {
+                flow_control: false,
+                ready_to_communicate: false,
+                ready_to_receive: false,
+                incoming_call: false,
+                data_valid: false,
+            };
+            f(&mut s);
+            s.encode()
+        };
+        assert_eq!(only(|s| s.flow_control = true), 0b0000_0011);
+        assert_eq!(only(|s| s.ready_to_communicate = true), 0b0000_0101);
+        assert_eq!(only(|s| s.ready_to_receive = true), 0b0000_1001);
+        assert_eq!(only(|s| s.incoming_call = true), 0b0100_0001);
+        assert_eq!(only(|s| s.data_valid = true), 0b1000_0001);
+
+        // Биты 5 и 6 зарезервированы и при кодировании всегда нулевые.
+        assert_eq!(V24Signals::DTE_READY.encode() & 0b0011_0000, 0);
+        assert_eq!(V24Signals::decode(0x00), None, "EA = 0 недопустим");
     }
 
     #[test]
