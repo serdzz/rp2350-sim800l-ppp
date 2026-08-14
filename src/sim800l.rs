@@ -3,10 +3,12 @@
 
 use atat::Error as AtError;
 use atat::asynch::AtatClient;
+use embassy_futures::select::{Either, select};
 use embassy_rp::gpio::Output;
 use embassy_time::{Duration, Timer};
 use embedded_io_async::Write;
 
+use crate::UrcSub;
 use crate::config;
 use crate::modem::*;
 
@@ -27,6 +29,11 @@ pub enum BringUpError {
     NotAttached,
     /// Модем не отдал `CONNECT` на строку дозвона.
     DialFailed,
+    /// Модуль перезагрузился посреди инициализации (пришёл `RDY`).
+    ///
+    /// Почти всегда означает провал питания: регистрация в сети идёт на полной
+    /// мощности передатчика, и просадка сбрасывает модуль ровно в этот момент.
+    ModemReset,
     /// Ошибка транспорта/протокола AT.
     At(AtError),
 }
@@ -57,7 +64,11 @@ pub async fn power_on(pwrkey: &mut Output<'_>) {
 ///
 /// После успешного возврата UART находится в data-режиме и его нужно отдать
 /// [`embassy_net_ppp::Runner::run`].
-pub async fn bring_up<A: AtatClient>(client: &mut A, apn: &str) -> Result<(), BringUpError> {
+pub async fn bring_up<A: AtatClient>(
+    client: &mut A,
+    apn: &str,
+    urc: &mut UrcSub,
+) -> Result<(), BringUpError> {
     // 1. Синхронизация. Первые "AT" заодно запускают автоопределение скорости.
     sync(client).await?;
 
@@ -90,7 +101,7 @@ pub async fn bring_up<A: AtatClient>(client: &mut A, apn: &str) -> Result<(), Br
     log_sim_identity(client).await;
 
     // 5. Ждём регистрации в GSM и GPRS.
-    wait_registration(client).await?;
+    wait_registration(client, urc).await?;
 
     // 6. PDP-контекст под наш APN.
     info!("SIM800L: APN = {}", apn);
@@ -197,7 +208,32 @@ fn rssi_dbm(rssi: u8) -> i16 {
     }
 }
 
-async fn wait_registration<A: AtatClient>(client: &mut A) -> Result<(), BringUpError> {
+/// Ждёт `RDY` — незапрошенный признак того, что модуль загрузился заново.
+async fn wait_for_modem_reset(urc: &mut UrcSub) {
+    loop {
+        if matches!(urc.next_message_pure().await, Urc::Ready) {
+            return;
+        }
+    }
+}
+
+async fn wait_registration<A: AtatClient>(
+    client: &mut A,
+    urc: &mut UrcSub,
+) -> Result<(), BringUpError> {
+    // Выбрасываем URC, накопившиеся за время включения модуля: `RDY` от штатной
+    // загрузки не должен выглядеть как перезагрузка посреди работы.
+    while urc.try_next_message_pure().is_some() {}
+
+    // Регистрация — самая долгая фаза (минуты). Если модуль под нами уйдёт в
+    // ребут, продолжать опрос бессмысленно: выходим сразу, а не через таймаут.
+    match select(poll_registration(client), wait_for_modem_reset(urc)).await {
+        Either::First(result) => result,
+        Either::Second(()) => Err(BringUpError::ModemReset),
+    }
+}
+
+async fn poll_registration<A: AtatClient>(client: &mut A) -> Result<(), BringUpError> {
     for attempt in 0..config::REGISTRATION_ATTEMPTS {
         let csq = client.send(&GetSignalQuality).await;
         let gsm = client.send(&GetNetworkRegistration).await;

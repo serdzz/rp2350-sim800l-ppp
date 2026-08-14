@@ -81,6 +81,14 @@ const UART_RX_BUF_SIZE: usize = 2048;
 static RES_SLOT: ResponseSlot<INGRESS_BUF_SIZE> = ResponseSlot::new();
 static URC_CHANNEL: UrcChannel<Urc, URC_CAPACITY, URC_SUBSCRIBERS> = UrcChannel::new();
 
+/// Подписка на URC, которую держит логика инициализации модема.
+///
+/// Вторая после `urc_task`; ровно поэтому [`URC_SUBSCRIBERS`] равен двум.
+pub type UrcSub = UrcSubscription<'static, Urc, URC_CAPACITY, URC_SUBSCRIBERS>;
+
+/// Сколько перезагрузок модуля подряд считать признаком проблем с питанием.
+const RESET_STREAK_HINT: u32 = 3;
+
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
     ADC_IRQ_FIFO => AdcInterruptHandler;
@@ -205,6 +213,13 @@ async fn main(spawner: Spawner) {
         password: config::PPP_PASSWORD,
     };
 
+    // Отдельная подписка для bring_up: по `RDY` он поймёт, что модуль ушёл
+    // в перезагрузку, и не будет две минуты опрашивать мёртвую железку.
+    let mut bring_up_urc: UrcSub = unwrap!(URC_CHANNEL.subscribe().ok());
+
+    // Сколько раз подряд модуль перезагрузился посреди инициализации.
+    let mut reset_streak = 0u32;
+
     // Модуль включаем один раз; дальше при обрывах переподнимаем только сессию.
     sim800l::power_on(&mut pwrkey).await;
 
@@ -226,7 +241,7 @@ async fn main(spawner: Spawner) {
             let ingress_fut = async {
                 ingress.read_from(Compat(uart_rx)).await;
             };
-            let setup_fut = sim800l::bring_up(&mut client, config::APN);
+            let setup_fut = sim800l::bring_up(&mut client, config::APN, &mut bring_up_urc);
 
             match select(ingress_fut, setup_fut).await {
                 Either::First(()) => unreachable!(),
@@ -235,12 +250,31 @@ async fn main(spawner: Spawner) {
         };
 
         if let Err(e) = bring_up {
-            error!("Инициализация модема не удалась: {:?}", e);
+            if matches!(e, sim800l::BringUpError::ModemReset) {
+                reset_streak += 1;
+                warn!(
+                    "Модуль перезагрузился во время инициализации (подряд: {})",
+                    reset_streak
+                );
+                if reset_streak >= RESET_STREAK_HINT {
+                    error!(
+                        "SIM800L перезагружается циклически. Регистрация идёт на полной \
+                         мощности передатчика (до 2 А импульсами) — проверьте питание: \
+                         электролит 1000 мкФ прямо на VCC/GND модуля, отдельные толстые \
+                         провода от аккумулятора мимо макетки, заряд батареи."
+                    );
+                }
+            } else {
+                reset_streak = 0;
+                error!("Инициализация модема не удалась: {:?}", e);
+            }
             // Вернуть модем в вменяемое состояние и попробовать снова.
             sim800l::escape_data_mode(&mut uart).await;
             Timer::after(Duration::from_secs(config::RECONNECT_DELAY_SECS)).await;
             continue;
         }
+
+        reset_streak = 0;
 
         // ---------- фаза 2: data-режим (PPP владеет UART) ----------
         let result = ppp_runner
