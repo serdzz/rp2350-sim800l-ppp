@@ -33,7 +33,11 @@ use embassy_sync::pipe::{DynamicReader, DynamicWriter};
 use embedded_io::ErrorKind;
 use embedded_io_async::{BufRead, ErrorType, Read, Write};
 
-use crate::cmux::{Decoder, Event, Frame, Session, UihFraming};
+use embassy_time::{Duration, Instant, Timer};
+
+use crate::cmux::{
+    CONTROL_DLCI, ChannelState, Decoder, Event, Frame, Session, UihFraming, control,
+};
 
 /// Передатчик, общий на все каналы.
 pub type SharedTx<T> = Mutex<CriticalSectionRawMutex, T>;
@@ -158,6 +162,159 @@ pub async fn send_frame<T: Write>(tx: &SharedTx<T>, frame: &Frame<'_>) -> Result
     let n = frame.encode(&mut buf).map_err(|_| Error::Framing)?;
     let mut tx = tx.lock().await;
     tx.write_all(&buf[..n]).await.map_err(|_| Error::Write)
+}
+
+/// Отправить сообщение управляющего канала: UIH на DLCI 0 с телом
+/// «тип — длина — значение».
+pub async fn send_control_message<T: Write>(
+    tx: &SharedTx<T>,
+    bits: u8,
+    command: bool,
+    value: &[u8],
+) -> Result<(), Error> {
+    let mut message = [0u8; 8];
+    let len = control::encode(bits, command, value, &mut message).map_err(|_| Error::Framing)?;
+
+    let mut buf = [0u8; 16];
+    let n = Frame::uih(CONTROL_DLCI, &message[..len])
+        .encode(&mut buf)
+        .map_err(|_| Error::Framing)?;
+
+    let mut tx = tx.lock().await;
+    tx.write_all(&buf[..n]).await.map_err(|_| Error::Write)
+}
+
+/// Сообщить модему, что канал готов к обмену (MSC с сигналами V.24).
+///
+/// Спецификация (§5.4.6.3.7) требует слать это до любых пользовательских
+/// данных на только что созданном канале.
+pub async fn announce_channel<T: Write>(tx: &SharedTx<T>, dlci: u8) -> Result<(), Error> {
+    // Значение MSC: октет DLCI (бит 2 всегда единичный) и октет сигналов.
+    let value = [(dlci << 2) | 0b11, control::V24Signals::DTE_READY.encode()];
+    send_control_message(tx, control::MSC, true, &value).await
+}
+
+/// Попросить модем выйти из мультиплексного режима (CLD, §5.4.6.3.3).
+pub async fn close_multiplexer<T: Write>(tx: &SharedTx<T>) -> Result<(), Error> {
+    send_control_message(tx, control::CLD, true, &[]).await
+}
+
+/// Что помешало поднять мультиплексор.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "_defmt", derive(defmt::Format))]
+pub enum BringUpError {
+    /// Не удалось записать в UART.
+    Io(Error),
+    /// Модем не подтвердил открытие канала за отведённое время.
+    Timeout(u8),
+    /// Канал оказался в неожиданном состоянии.
+    State(u8),
+}
+
+impl From<Error> for BringUpError {
+    fn from(e: Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+/// Как часто опрашивать состояние канала, ожидая подтверждения.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Дождаться, пока канал перейдёт в нужное состояние.
+///
+/// Подтверждение приходит в [`pump`], в другой задаче, поэтому смотрим на
+/// общее состояние. Опрос, а не сигнал: это происходит один раз при подъёме,
+/// и лишний примитив синхронизации ради него не окупается.
+async fn wait_state(
+    session: &SharedSession,
+    dlci: u8,
+    want: ChannelState,
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if session.lock().await.state(dlci) == want {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        Timer::after(POLL_INTERVAL).await;
+    }
+}
+
+/// Открыть канал: SABM и ожидание UA, с повторами.
+///
+/// Повторы обязательны: при входе в мультиплексный режим модем нередко
+/// пропускает первый SABM, пока переключает разбор входного потока.
+pub async fn open_channel<T: Write>(
+    tx: &SharedTx<T>,
+    session: &SharedSession,
+    dlci: u8,
+    attempts: u32,
+    timeout: Duration,
+) -> Result<(), BringUpError> {
+    for attempt in 1..=attempts {
+        let sabm = {
+            let mut session = session.lock().await;
+            if session.state(dlci) == ChannelState::Open {
+                return Ok(());
+            }
+            // Предыдущая попытка могла оставить канал в Opening.
+            session.force_closed(dlci);
+            session.open(dlci).map_err(|_| BringUpError::State(dlci))?
+        };
+
+        send_frame(tx, &sabm).await?;
+
+        if wait_state(session, dlci, ChannelState::Open, timeout).await {
+            info!("CMUX: канал {} открыт (попытка {})", dlci, attempt);
+            return Ok(());
+        }
+        warn!("CMUX: канал {} не подтверждён, попытка {}", dlci, attempt);
+    }
+
+    Err(BringUpError::Timeout(dlci))
+}
+
+/// Какие каналы поднимать.
+#[derive(Debug, Clone, Copy)]
+pub struct Channels {
+    /// Канал под AT-команды.
+    pub at: u8,
+    /// Канал под PPP.
+    pub ppp: u8,
+    pub attempts: u32,
+    pub timeout: Duration,
+}
+
+/// Поднять мультиплексор: управляющий канал, затем каналы данных.
+///
+/// Вызывать уже после того, как модем принял `AT+CMUX` и [`pump`] запущен:
+/// подтверждения приходят только через насос.
+pub async fn bring_up<T: Write>(
+    tx: &SharedTx<T>,
+    session: &SharedSession,
+    channels: Channels,
+) -> Result<(), BringUpError> {
+    // Управляющий канал первым — через него идут MSC и CLD (§5.4.6).
+    open_channel(
+        tx,
+        session,
+        CONTROL_DLCI,
+        channels.attempts,
+        channels.timeout,
+    )
+    .await?;
+
+    for dlci in [channels.at, channels.ppp] {
+        open_channel(tx, session, dlci, channels.attempts, channels.timeout).await?;
+        // Сигналы V.24 до первых данных, как требует спецификация.
+        announce_channel(tx, dlci).await?;
+    }
+
+    info!("CMUX: мультиплексор поднят");
+    Ok(())
 }
 
 /// Насос: читает UART, разбирает кадры и разводит их по каналам.

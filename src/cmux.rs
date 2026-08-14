@@ -33,6 +33,9 @@
 
 #![allow(dead_code)]
 
+/// Управляющий канал мультиплексора (§5.4.6): через него идут MSC и CLD.
+pub const CONTROL_DLCI: u8 = 0;
+
 /// Флаг начала и конца кадра (§5.2.1.1).
 pub const FLAG: u8 = 0xF9;
 
@@ -791,6 +794,18 @@ impl Session {
         Ok(Frame::disc(dlci))
     }
 
+    /// Принудительно вернуть канал в закрытое состояние.
+    ///
+    /// Нужно для повторной попытки открытия: если модем не ответил на SABM,
+    /// канал так и висит в [`ChannelState::Opening`], и [`Session::open`]
+    /// откажется выдать новый кадр. Молчание модема — штатная ситуация при
+    /// входе в мультиплексный режим, поэтому попытку надо уметь повторять.
+    pub fn force_closed(&mut self, dlci: u8) {
+        if let Some(state) = self.channels.get_mut(dlci as usize) {
+            *state = ChannelState::Closed;
+        }
+    }
+
     fn expect(&self, dlci: u8, want: ChannelState) -> Result<(), SessionError> {
         if dlci > 0x3F {
             return Err(SessionError::DlciOutOfRange);
@@ -1419,6 +1434,24 @@ mod tests {
         // Граница перехода на двухоктетную длину видна по размеру заголовка.
         assert_eq!(UihFraming::new(1, 127).unwrap().header().len(), 4);
         assert_eq!(UihFraming::new(1, 128).unwrap().header().len(), 5);
+    }
+
+    /// Повторная попытка открытия после молчания модема.
+    #[test]
+    fn force_closed_allows_retry() {
+        let mut s = Session::new();
+        s.open(1).unwrap();
+        assert_eq!(s.state(1), ChannelState::Opening);
+
+        // Без сброса повторный SABM выдать нельзя.
+        assert!(s.open(1).is_err());
+
+        s.force_closed(1);
+        assert_eq!(s.state(1), ChannelState::Closed);
+        assert!(s.open(1).is_ok());
+
+        // Несуществующий DLCI не должен паниковать.
+        s.force_closed(200);
     }
 
     /// Октет типа CLD из §5.4.6.3.3: биты 7 и 8 единичные, остальные нули.

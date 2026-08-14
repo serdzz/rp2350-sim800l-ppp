@@ -40,6 +40,8 @@ pub enum BringUpError {
     NotAttached,
     /// Модем не отдал `CONNECT` на строку дозвона.
     DialFailed,
+    /// Модем не принял `AT+CMUX`.
+    CmuxRefused,
     /// Модуль перезагрузился посреди инициализации (пришёл `RDY`).
     ///
     /// Почти всегда означает провал питания: регистрация в сети идёт на полной
@@ -156,6 +158,31 @@ pub async fn bring_up<A: AtatClient>(
         })?;
 
     info!("SIM800L: CONNECT — переходим в PPP");
+    Ok(())
+}
+
+/// Перевести модем в мультиплексный режим.
+///
+/// После успеха обычный AT-обмен по этому UART заканчивается: порт надо
+/// передать насосу из [`crate::cmux_transport`], а `atat` посадить на
+/// логический канал. Вызывать в самом конце настройки — всё, что удобнее
+/// сделать простыми AT-командами, должно быть сделано до.
+// allow(dead_code): вызывается только на пути с мультиплексором.
+#[allow(dead_code)]
+pub async fn enter_cmux<A: AtatClient>(client: &mut A, n1: u16) -> Result<(), BringUpError> {
+    info!("SIM800L: переходим в мультиплексный режим, N1 = {}", n1);
+    client
+        .send(&SetCmuxMode {
+            mode: 0,       // basic option
+            subset: 0,     // только UIH
+            port_speed: 5, // 115200 бод по кодировке 27.007
+            n1,
+        })
+        .await
+        .map_err(|e| {
+            warn!("SIM800L: AT+CMUX отклонён: {:?}", e);
+            BringUpError::CmuxRefused
+        })?;
     Ok(())
 }
 

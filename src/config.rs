@@ -34,6 +34,25 @@ pub const SCAN_OPERATORS_ON_FAILURE: bool = true;
 /// питания — да, в отлаженном устройстве можно выключить.
 pub const TREAT_READY_URCS_AS_RESET: bool = true;
 
+// --- CMUX (ветка feat/cmux) ---
+// allow(dead_code): транспорт ещё не подключён, рабочий путь идёт без него.
+
+/// Канал под AT-команды в мультиплексном режиме.
+#[allow(dead_code)]
+pub const CMUX_AT_DLCI: u8 = 1;
+/// Канал под PPP.
+#[allow(dead_code)]
+pub const CMUX_PPP_DLCI: u8 = 2;
+/// N1 из `AT+CMUX` — максимум байт в поле данных кадра.
+///
+/// 127 держит поле длины однооктетным; PPP при этом просто разложит свои
+/// кадры на несколько UIH.
+#[allow(dead_code)]
+pub const CMUX_MAX_PAYLOAD: u16 = 127;
+/// Сколько раз повторить SABM, если модем промолчал.
+#[allow(dead_code)]
+pub const CMUX_OPEN_ATTEMPTS: u32 = 5;
+
 /// Пауза перед повторной попыткой после развала PPP-сессии.
 pub const RECONNECT_DELAY_SECS: u64 = 10;
 
