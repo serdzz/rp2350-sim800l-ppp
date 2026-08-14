@@ -85,6 +85,10 @@ pub async fn bring_up<A: AtatClient>(client: &mut A, apn: &str) -> Result<(), Br
         return Err(BringUpError::SimNotReady);
     }
 
+    // 4a. Кто эта SIM. Пишем до регистрации: если сеть откажет, по MCC/MNC
+    //     будет видно, свой это оператор или роуминг.
+    log_sim_identity(client).await;
+
     // 5. Ждём регистрации в GSM и GPRS.
     wait_registration(client).await?;
 
@@ -131,6 +135,31 @@ async fn sync<A: AtatClient>(client: &mut A) -> Result<(), BringUpError> {
         Timer::after(Duration::from_millis(500)).await;
     }
     Err(BringUpError::NoResponse)
+}
+
+/// Пишет в лог идентификаторы SIM.
+///
+/// Ошибки не фатальны: без IMSI регистрация всё равно возможна, это чисто
+/// диагностика. ВНИМАНИЕ: IMSI и ICCID — персональные идентификаторы абонента,
+/// не выкладывайте такой лог в публичный доступ как есть.
+async fn log_sim_identity<A: AtatClient>(client: &mut A) {
+    match client.send(&GetImsi).await {
+        Ok(imsi) => {
+            let s = imsi.text.as_str();
+            info!(
+                "SIM800L: IMSI {} — домашняя сеть MCC {} / MNC {}",
+                s,
+                imsi_mcc(s),
+                imsi_mnc(s)
+            );
+        }
+        Err(e) => warn!("SIM800L: IMSI не прочитан: {:?}", e),
+    }
+
+    match client.send(&GetIccid).await {
+        Ok(iccid) => info!("SIM800L: ICCID {}", iccid.text.as_str()),
+        Err(e) => warn!("SIM800L: ICCID не прочитан: {:?}", e),
+    }
 }
 
 /// Расшифровка `<stat>` из `+CREG?` / `+CGREG?` (3GPP TS 27.007).

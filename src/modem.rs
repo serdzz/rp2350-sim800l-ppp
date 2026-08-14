@@ -164,6 +164,39 @@ pub struct GetNetworkRegistration;
 #[at_cmd("+CGREG?", RegistrationStatus, timeout_ms = 2_000)]
 pub struct GetGprsRegistration;
 
+/// `AT+CIMI` — IMSI абонента.
+///
+/// Ответ приходит голым числом, **без** префикса `+CIMI:`, поэтому берём его
+/// как есть. По первым цифрам видно домашнюю сеть — а значит, свой это
+/// оператор отказывает в регистрации или чужой в роуминге.
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+CIMI", RawLine, parse = parse_raw_line, timeout_ms = 5_000)]
+pub struct GetImsi;
+
+/// `AT+CCID` — ICCID, серийный номер самой SIM-карты. Тоже без префикса.
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+CCID", RawLine, parse = parse_raw_line, timeout_ms = 5_000)]
+pub struct GetIccid;
+
+/// MCC — первые три цифры IMSI (код страны). `"???"`, если строка короче.
+pub fn imsi_mcc(imsi: &str) -> &str {
+    imsi.get(..3).unwrap_or("???")
+}
+
+/// MNC — код оператора, следующий за MCC.
+///
+/// Длина MNC не фиксирована: в Европе он двузначный, в Северной Америке
+/// (MCC 3xx) и ещё нескольких планах — трёхзначный. Разбираем по MCC, а для
+/// неизвестного формата возвращаем две цифры как наиболее частый случай.
+pub fn imsi_mnc(imsi: &str) -> &str {
+    let three_digit_mnc = matches!(
+        imsi_mcc(imsi),
+        "310" | "311" | "312" | "313" | "316" | "302"
+    );
+    let end = if three_digit_mnc { 6 } else { 5 };
+    imsi.get(3..end).unwrap_or("??")
+}
+
 /// `AT+COPS?` — на какой сети мы сейчас.
 ///
 /// Ответ разбирается «как есть»: у незарегистрированного модуля полей меньше.

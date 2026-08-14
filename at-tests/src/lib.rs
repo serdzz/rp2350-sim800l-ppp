@@ -102,6 +102,36 @@ mod tests {
         assert!(r.text.as_str().contains("MTS"));
     }
 
+    /// `AT+CIMI` и `AT+CCID` отвечают голым числом без префикса — обычный
+    /// разбор по полям на таком ответе не работает.
+    #[test]
+    fn sim_identity_commands() {
+        assert_eq!(ser(&GetImsi), "AT+CIMI\r");
+        assert_eq!(ser(&GetIccid), "AT+CCID\r");
+
+        let r = GetImsi.parse(Ok(b"247010123456789")).unwrap();
+        assert_eq!(r.text.as_str(), "247010123456789");
+
+        let r = GetIccid.parse(Ok(b"8937101234567890123")).unwrap();
+        assert_eq!(r.text.as_str(), "8937101234567890123");
+    }
+
+    #[test]
+    fn imsi_splits_into_mcc_and_mnc() {
+        // Латвия, Tele2 (247-02) — MNC двузначный.
+        assert_eq!(imsi_mcc("247020123456789"), "247");
+        assert_eq!(imsi_mnc("247020123456789"), "02");
+
+        // США (310-260, T-Mobile) — MNC трёхзначный.
+        assert_eq!(imsi_mcc("310260123456789"), "310");
+        assert_eq!(imsi_mnc("310260123456789"), "260");
+
+        // Мусор на входе не должен паниковать.
+        assert_eq!(imsi_mcc(""), "???");
+        assert_eq!(imsi_mnc(""), "??");
+        assert_eq!(imsi_mnc("24"), "??");
+    }
+
     /// Длинный список сетей обязан обрезаться, а не паниковать.
     #[test]
     fn raw_line_truncates_instead_of_panicking() {
