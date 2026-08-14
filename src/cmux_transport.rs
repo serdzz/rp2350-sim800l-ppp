@@ -23,10 +23,6 @@
 //!    штатное поведение `embedded_io_async::Write`, а `write_all` разложит
 //!    длинную запись на несколько кадров сам.
 
-// Пока никто не вызывается: рабочий путь в main.rs идёт без мультиплексора.
-// Снять, когда транспорт будет подключён.
-#![allow(dead_code)]
-
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::pipe::{DynamicReader, DynamicWriter};
@@ -75,16 +71,26 @@ impl embedded_io::Error for Error {
     }
 }
 
-/// Логический канал: выглядит как обычный поток байт.
-///
-/// Реализует `Read`, `BufRead` и `Write` из `embedded-io-async`, поэтому
-/// отдаётся `embassy_net_ppp::Runner::run` напрямую. Для `atat`, который сидит
-/// на версии 0.6, понадобится обёртка `Compat` из [`crate::io_compat`].
-pub struct Channel<'a, T: Write> {
-    dlci: u8,
+/// Читающая половина канала.
+pub struct ChannelRx<'a> {
     rx: DynamicReader<'a>,
+}
+
+/// Пишущая половина канала: обрамляет данные в UIH и отдаёт в общий UART.
+pub struct ChannelTx<'a, T: Write> {
+    dlci: u8,
     tx: &'a SharedTx<T>,
     max_payload: usize,
+}
+
+/// Логический канал целиком.
+///
+/// Реализует `Read`, `BufRead` и `Write` из `embedded-io-async`, поэтому
+/// отдаётся `embassy_net_ppp::Runner::run` напрямую. `atat` же хочет чтение и
+/// запись отдельными объектами — для него канал делится [`Channel::split`].
+pub struct Channel<'a, T: Write> {
+    rx: ChannelRx<'a>,
+    tx: ChannelTx<'a, T>,
 }
 
 impl<'a, T: Write> Channel<'a, T> {
@@ -92,29 +98,37 @@ impl<'a, T: Write> Channel<'a, T> {
     /// `max_payload` — значение N1 из `AT+CMUX`.
     pub fn new(dlci: u8, rx: DynamicReader<'a>, tx: &'a SharedTx<T>, max_payload: usize) -> Self {
         Self {
-            dlci,
-            rx,
-            tx,
-            max_payload,
+            rx: ChannelRx { rx },
+            tx: ChannelTx {
+                dlci,
+                tx,
+                max_payload,
+            },
         }
     }
 
+    #[allow(dead_code)] // пригодится при отладке маршрутизации
     pub fn dlci(&self) -> u8 {
-        self.dlci
+        self.tx.dlci
+    }
+
+    /// Разделить на половины — так канал подходит `atat`.
+    pub fn split(self) -> (ChannelRx<'a>, ChannelTx<'a, T>) {
+        (self.rx, self.tx)
     }
 }
 
-impl<T: Write> ErrorType for Channel<'_, T> {
+impl ErrorType for ChannelRx<'_> {
     type Error = Error;
 }
 
-impl<T: Write> Read for Channel<'_, T> {
+impl Read for ChannelRx<'_> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         Ok(self.rx.read(buf).await)
     }
 }
 
-impl<T: Write> BufRead for Channel<'_, T> {
+impl BufRead for ChannelRx<'_> {
     async fn fill_buf(&mut self) -> Result<&[u8], Self::Error> {
         Ok(self.rx.fill_buf().await)
     }
@@ -124,7 +138,11 @@ impl<T: Write> BufRead for Channel<'_, T> {
     }
 }
 
-impl<T: Write> Write for Channel<'_, T> {
+impl<T: Write> ErrorType for ChannelTx<'_, T> {
+    type Error = Error;
+}
+
+impl<T: Write> Write for ChannelTx<'_, T> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
         let n = buf.len().min(self.max_payload);
         let framing = UihFraming::new(self.dlci, n).map_err(|_| Error::Framing)?;
@@ -144,6 +162,36 @@ impl<T: Write> Write for Channel<'_, T> {
     async fn flush(&mut self) -> Result<(), Self::Error> {
         let mut tx = self.tx.lock().await;
         tx.flush().await.map_err(|_| Error::Write)
+    }
+}
+
+impl<T: Write> ErrorType for Channel<'_, T> {
+    type Error = Error;
+}
+
+impl<T: Write> Read for Channel<'_, T> {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
+        self.rx.read(buf).await
+    }
+}
+
+impl<T: Write> BufRead for Channel<'_, T> {
+    async fn fill_buf(&mut self) -> Result<&[u8], Self::Error> {
+        self.rx.fill_buf().await
+    }
+
+    fn consume(&mut self, amt: usize) {
+        self.rx.consume(amt);
+    }
+}
+
+impl<T: Write> Write for Channel<'_, T> {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+        self.tx.write(buf).await
+    }
+
+    async fn flush(&mut self) -> Result<(), Self::Error> {
+        self.tx.flush().await
     }
 }
 
@@ -195,6 +243,10 @@ pub async fn announce_channel<T: Write>(tx: &SharedTx<T>, dlci: u8) -> Result<()
 }
 
 /// Попросить модем выйти из мультиплексного режима (CLD, §5.4.6.3.3).
+///
+/// Пока не вызывается: сеанс завершается сбросом модема через `+++`/`ATH`,
+/// что надёжнее в ситуации, когда мультиплексор уже развалился.
+#[allow(dead_code)]
 pub async fn close_multiplexer<T: Write>(tx: &SharedTx<T>) -> Result<(), Error> {
     send_control_message(tx, control::CLD, true, &[]).await
 }

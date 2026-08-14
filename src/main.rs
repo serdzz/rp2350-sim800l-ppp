@@ -34,10 +34,10 @@ mod sim800l;
 #[cfg(feature = "log-usb")]
 mod usb_logger;
 
-use atat::asynch::Client;
+use atat::asynch::{AtatClient, Client};
 use atat::{AtatIngress, DefaultDigester, Ingress, ResponseSlot, UrcChannel, UrcSubscription};
 use embassy_executor::Spawner;
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_net::{Config as NetConfig, ConfigV4, Ipv4Cidr, StackResources, StaticConfigV4};
 use embassy_rp::adc::{
     Adc, Channel as AdcChannel, Config as AdcConfig, InterruptHandler as AdcInterruptHandler,
@@ -47,6 +47,9 @@ use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
 use embassy_rp::peripherals::UART0;
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::mutex::Mutex;
+use embassy_sync::pipe::{DynamicReader, DynamicWriter, Pipe};
 use embassy_time::{Duration, Timer};
 use static_cell::StaticCell;
 
@@ -87,6 +90,17 @@ static URC_CHANNEL: UrcChannel<Urc, URC_CAPACITY, URC_SUBSCRIBERS> = UrcChannel:
 ///
 /// Вторая после `urc_task`; ровно поэтому [`URC_SUBSCRIBERS`] равен двум.
 pub type UrcSub = UrcSubscription<'static, Urc, URC_CAPACITY, URC_SUBSCRIBERS>;
+
+/// Разборщик ответов модема со всеми размерами буферов, зафиксированными выше.
+type ModemIngress =
+    Ingress<'static, DefaultDigester<Urc>, Urc, INGRESS_BUF_SIZE, URC_CAPACITY, URC_SUBSCRIBERS>;
+
+/// Размер приёмного буфера декодера CMUX: кадр PPP плюс запас.
+const CMUX_DECODE_BUF: usize = 1600;
+/// Труба AT-канала.
+const CMUX_AT_PIPE: usize = 512;
+/// Труба PPP-канала — должна вмещать хотя бы кадр PPP целиком.
+const CMUX_PPP_PIPE: usize = 2048;
 
 /// Сколько перезагрузок модуля подряд считать признаком проблем с питанием.
 const RESET_STREAK_HINT: u32 = 3;
@@ -168,7 +182,7 @@ async fn main(spawner: Spawner) {
     let mut uart_config = UartConfig::default();
     uart_config.baudrate = config::UART_BAUDRATE;
 
-    let mut uart = BufferedUart::new(
+    let uart = BufferedUart::new(
         p.UART0,
         p.PIN_0,
         p.PIN_1,
@@ -180,8 +194,7 @@ async fn main(spawner: Spawner) {
 
     // --- PPP-драйвер как embassy-net Device -------------------------------
     static PPP_STATE: StaticCell<embassy_net_ppp::State<4, 4>> = StaticCell::new();
-    let (device, mut ppp_runner) =
-        embassy_net_ppp::new(PPP_STATE.init(embassy_net_ppp::State::new()));
+    let (device, ppp_runner) = embassy_net_ppp::new(PPP_STATE.init(embassy_net_ppp::State::new()));
 
     // --- Сетевой стек ------------------------------------------------------
     // IP-конфигурацию не задаём: её принесёт IPCP при подъёме PPP.
@@ -204,7 +217,7 @@ async fn main(spawner: Spawner) {
 
     // with_custom_success: SIM800L отвечает на AT+CIPSHUT строкой `SHUT OK`,
     // которую штатный дайджестер не считает успехом — см. modem::parse_shut_ok.
-    let mut ingress = Ingress::new(
+    let ingress = Ingress::new(
         DefaultDigester::<Urc>::new().with_custom_success(modem::parse_shut_ok),
         INGRESS_BUF.init([0; INGRESS_BUF_SIZE]),
         &RES_SLOT,
@@ -221,11 +234,72 @@ async fn main(spawner: Spawner) {
     // в перезагрузку, и не будет две минуты опрашивать мёртвую железку.
     let mut bring_up_urc: UrcSub = unwrap!(URC_CHANNEL.subscribe().ok());
 
-    // Сколько раз подряд модуль перезагрузился посреди инициализации.
-    let mut reset_streak = 0u32;
-
     // Модуль включаем один раз; дальше при обрывах переподнимаем только сессию.
     sim800l::power_on(&mut pwrkey).await;
+
+    if config::USE_CMUX {
+        run_multiplexed(
+            uart,
+            ppp_runner,
+            stack,
+            ingress,
+            cmd_buf,
+            &mut bring_up_urc,
+            ppp_config,
+        )
+        .await
+    } else {
+        run_plain(
+            uart,
+            ppp_runner,
+            stack,
+            ingress,
+            cmd_buf,
+            &mut bring_up_urc,
+            ppp_config,
+        )
+        .await
+    }
+}
+
+/// Применить IPv4-конфигурацию, полученную по IPCP.
+fn apply_ipv4(stack: embassy_net::Stack<'static>, ipv4: embassy_net_ppp::Ipv4Status) {
+    let Some(address) = ipv4.address else {
+        warn!("PPP: пир не выдал IPv4-адрес");
+        return;
+    };
+
+    let mut dns_servers = heapless::Vec::new();
+    for server in ipv4.dns_servers.iter().flatten() {
+        let _ = dns_servers.push(*server);
+    }
+
+    info!("PPP: адрес {:?}, пир {:?}", address, ipv4.peer_address);
+
+    // Маска /0 + отсутствие шлюза — стандартная конфигурация для
+    // point-to-point линка: весь трафик уходит в PPP-интерфейс.
+    stack.set_config_v4(ConfigV4::Static(StaticConfigV4 {
+        address: Ipv4Cidr::new(address, 0),
+        gateway: None,
+        dns_servers,
+    }));
+}
+
+/// Проверенный путь: UART принадлежит то `atat`, то PPP.
+///
+/// Пока канал поднят, модем недоступен для команд — ради снятия этого
+/// ограничения и делается [`run_multiplexed`].
+async fn run_plain(
+    mut uart: BufferedUart,
+    mut ppp_runner: embassy_net_ppp::Runner<'static>,
+    stack: embassy_net::Stack<'static>,
+    mut ingress: ModemIngress,
+    cmd_buf: &'static mut [u8; CMD_BUF_SIZE],
+    bring_up_urc: &mut UrcSub,
+    ppp_config: embassy_net_ppp::Config<'static>,
+) -> ! {
+    // Сколько раз подряд модуль перезагрузился посреди инициализации.
+    let mut reset_streak = 0u32;
 
     loop {
         // ---------- фаза 1: командный режим (atat владеет UART) ----------
@@ -245,7 +319,7 @@ async fn main(spawner: Spawner) {
             let ingress_fut = async {
                 ingress.read_from(Compat(uart_rx)).await;
             };
-            let setup_fut = sim800l::bring_up(&mut client, config::APN, &mut bring_up_urc);
+            let setup_fut = sim800l::bring_up(&mut client, config::APN, bring_up_urc);
 
             match select(ingress_fut, setup_fut).await {
                 Either::First(()) => unreachable!(),
@@ -254,24 +328,7 @@ async fn main(spawner: Spawner) {
         };
 
         if let Err(e) = bring_up {
-            if matches!(e, sim800l::BringUpError::ModemReset) {
-                reset_streak += 1;
-                warn!(
-                    "Модуль перезагрузился во время инициализации (подряд: {})",
-                    reset_streak
-                );
-                if reset_streak >= RESET_STREAK_HINT {
-                    error!(
-                        "SIM800L перезагружается циклически. Регистрация идёт на полной \
-                         мощности передатчика (до 2 А импульсами) — проверьте питание: \
-                         электролит 1000 мкФ прямо на VCC/GND модуля, отдельные толстые \
-                         провода от аккумулятора мимо макетки, заряд батареи."
-                    );
-                }
-            } else {
-                reset_streak = 0;
-                error!("Инициализация модема не удалась: {:?}", e);
-            }
+            report_bring_up_error(&e, &mut reset_streak);
             // Вернуть модем в вменяемое состояние и попробовать снова.
             sim800l::escape_data_mode(&mut uart).await;
             Timer::after(Duration::from_secs(config::RECONNECT_DELAY_SECS)).await;
@@ -283,25 +340,7 @@ async fn main(spawner: Spawner) {
         // ---------- фаза 2: data-режим (PPP владеет UART) ----------
         let result = ppp_runner
             .run(&mut uart, ppp_config.clone(), |ipv4| {
-                let Some(address) = ipv4.address else {
-                    warn!("PPP: пир не выдал IPv4-адрес");
-                    return;
-                };
-
-                let mut dns_servers = heapless::Vec::new();
-                for server in ipv4.dns_servers.iter().flatten() {
-                    let _ = dns_servers.push(*server);
-                }
-
-                info!("PPP: адрес {:?}, пир {:?}", address, ipv4.peer_address);
-
-                // Маска /0 + отсутствие шлюза — стандартная конфигурация для
-                // point-to-point линка: весь трафик уходит в PPP-интерфейс.
-                stack.set_config_v4(ConfigV4::Static(StaticConfigV4 {
-                    address: Ipv4Cidr::new(address, 0),
-                    gateway: None,
-                    dns_servers,
-                }));
+                apply_ipv4(stack, ipv4)
             })
             .await;
 
@@ -317,4 +356,209 @@ async fn main(spawner: Spawner) {
         sim800l::escape_data_mode(&mut uart).await;
         Timer::after(Duration::from_secs(config::RECONNECT_DELAY_SECS)).await;
     }
+}
+
+fn report_bring_up_error(e: &sim800l::BringUpError, reset_streak: &mut u32) {
+    if matches!(e, sim800l::BringUpError::ModemReset) {
+        *reset_streak += 1;
+        warn!(
+            "Модуль перезагрузился во время инициализации (подряд: {})",
+            reset_streak
+        );
+        if *reset_streak >= RESET_STREAK_HINT {
+            error!(
+                "SIM800L перезагружается циклически. Регистрация идёт на полной \
+                 мощности передатчика (до 2 А импульсами) — проверьте питание: \
+                 электролит 1000 мкФ прямо на VCC/GND модуля, отдельные толстые \
+                 провода от аккумулятора мимо макетки, заряд батареи."
+            );
+        }
+    } else {
+        *reset_streak = 0;
+        error!("Инициализация модема не удалась: {:?}", e);
+    }
+}
+
+/// Путь с мультиплексором 27.010: AT-команды и PPP живут одновременно.
+///
+/// Порядок важен. Всё, что проще сделать простыми AT-командами — связь, SIM,
+/// регистрация, PDP-контекст — делается до `AT+CMUX`, потому что после него
+/// обычный AT-обмен по этому UART заканчивается.
+async fn run_multiplexed(
+    mut uart: BufferedUart,
+    mut ppp_runner: embassy_net_ppp::Runner<'static>,
+    stack: embassy_net::Stack<'static>,
+    mut ingress: ModemIngress,
+    cmd_buf: &'static mut [u8; CMD_BUF_SIZE],
+    bring_up_urc: &mut UrcSub,
+    ppp_config: embassy_net_ppp::Config<'static>,
+) -> ! {
+    let mut reset_streak = 0u32;
+
+    loop {
+        // ---------- фаза A: обычный AT, до входа в мультиплексор ----------
+        ingress.clear();
+
+        let prepared = {
+            let (uart_tx, uart_rx) = uart.split_ref();
+            let mut client = Client::new(
+                Compat(uart_tx),
+                &RES_SLOT,
+                &mut cmd_buf[..],
+                atat::Config::new(),
+            );
+            let ingress_fut = async {
+                ingress.read_from(Compat(uart_rx)).await;
+            };
+            let setup_fut = async {
+                sim800l::prepare(&mut client, config::APN, bring_up_urc).await?;
+                sim800l::enter_cmux(&mut client, config::CMUX_MAX_PAYLOAD).await
+            };
+
+            match select(ingress_fut, setup_fut).await {
+                Either::First(()) => unreachable!(),
+                Either::Second(result) => result,
+            }
+        };
+
+        if let Err(e) = prepared {
+            report_bring_up_error(&e, &mut reset_streak);
+            sim800l::escape_data_mode(&mut uart).await;
+            Timer::after(Duration::from_secs(config::RECONNECT_DELAY_SECS)).await;
+            continue;
+        }
+        reset_streak = 0;
+
+        // ---------- фаза B: мультиплексный режим ----------
+        ingress.clear();
+        multiplexed_session(
+            &mut uart,
+            &mut ppp_runner,
+            stack,
+            &mut ingress,
+            cmd_buf,
+            ppp_config.clone(),
+        )
+        .await;
+
+        stack.set_config_v4(ConfigV4::None);
+        // Просим модем вернуться в обычный AT-режим; если он уже там, вреда нет.
+        sim800l::escape_data_mode(&mut uart).await;
+        Timer::after(Duration::from_secs(config::RECONNECT_DELAY_SECS)).await;
+    }
+}
+
+/// Один сеанс работы через мультиплексор. Возвращается, когда что-то развалилось.
+async fn multiplexed_session(
+    uart: &mut BufferedUart,
+    ppp_runner: &mut embassy_net_ppp::Runner<'static>,
+    stack: embassy_net::Stack<'static>,
+    ingress: &mut ModemIngress,
+    cmd_buf: &mut [u8; CMD_BUF_SIZE],
+    ppp_config: embassy_net_ppp::Config<'static>,
+) {
+    let n1 = config::CMUX_MAX_PAYLOAD as usize;
+    let (uart_tx, mut uart_rx) = uart.split_ref();
+
+    let shared_tx: cmux_transport::SharedTx<_> = Mutex::new(uart_tx);
+    let session: cmux_transport::SharedSession = Mutex::new(cmux::Session::new());
+    let mut decoder = cmux::Decoder::<CMUX_DECODE_BUF>::new();
+
+    let mut at_pipe: Pipe<CriticalSectionRawMutex, CMUX_AT_PIPE> = Pipe::new();
+    let mut ppp_pipe: Pipe<CriticalSectionRawMutex, CMUX_PPP_PIPE> = Pipe::new();
+    let (at_reader, at_writer) = at_pipe.split();
+    let (ppp_reader, ppp_writer) = ppp_pipe.split();
+
+    let mut routes = [
+        cmux_transport::Route {
+            dlci: config::CMUX_AT_DLCI,
+            sink: DynamicWriter::from(at_writer),
+        },
+        cmux_transport::Route {
+            dlci: config::CMUX_PPP_DLCI,
+            sink: DynamicWriter::from(ppp_writer),
+        },
+    ];
+
+    // Насос обязан крутиться всё время: подтверждения открытия каналов и
+    // входящие данные идут только через него.
+    let pump_fut = async {
+        cmux_transport::pump(
+            &mut uart_rx,
+            &shared_tx,
+            &mut decoder,
+            &session,
+            &mut routes,
+        )
+        .await;
+    };
+
+    let app_fut = async {
+        if let Err(e) = cmux_transport::bring_up(
+            &shared_tx,
+            &session,
+            cmux_transport::Channels {
+                at: config::CMUX_AT_DLCI,
+                ppp: config::CMUX_PPP_DLCI,
+                attempts: config::CMUX_OPEN_ATTEMPTS,
+                timeout: Duration::from_secs(2),
+            },
+        )
+        .await
+        {
+            error!("CMUX: мультиплексор не поднялся: {:?}", e);
+            return;
+        }
+
+        let (at_rx, at_tx) = cmux_transport::Channel::new(
+            config::CMUX_AT_DLCI,
+            DynamicReader::from(at_reader),
+            &shared_tx,
+            n1,
+        )
+        .split();
+        let mut ppp_channel = cmux_transport::Channel::new(
+            config::CMUX_PPP_DLCI,
+            DynamicReader::from(ppp_reader),
+            &shared_tx,
+            n1,
+        );
+
+        // Дозвон идёт сырыми байтами прямо в PPP-канал: второй экземпляр
+        // atat ради одной команды не нужен.
+        if let Err(e) = sim800l::dial_on_stream(
+            &mut ppp_channel,
+            config::DIAL_STRING,
+            Duration::from_secs(30),
+        )
+        .await
+        {
+            error!("CMUX: дозвон не удался: {:?}", e);
+            return;
+        }
+
+        let mut client = Client::new(Compat(at_tx), &RES_SLOT, cmd_buf, atat::Config::new());
+
+        let ingress_fut = async {
+            ingress.read_from(Compat(at_rx)).await;
+        };
+        let ppp_fut = ppp_runner.run(&mut ppp_channel, ppp_config, |ipv4| apply_ipv4(stack, ipv4));
+        // Ради этого всё и затевалось: опрос модема, пока канал поднят.
+        let at_fut = async {
+            loop {
+                Timer::after(Duration::from_secs(30)).await;
+                match client.send(&modem::GetSignalQuality).await {
+                    Ok(csq) => info!("CMUX: CSQ {} при поднятом PPP", csq.rssi),
+                    Err(e) => warn!("CMUX: опрос CSQ не удался: {:?}", e),
+                }
+            }
+        };
+
+        match select3(ingress_fut, ppp_fut, at_fut).await {
+            Either3::Second(Err(e)) => warn!("CMUX: PPP-сессия завершена: {:?}", e),
+            _ => warn!("CMUX: сеанс прерван"),
+        }
+    };
+
+    select(pump_fut, app_fut).await;
 }

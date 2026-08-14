@@ -7,7 +7,7 @@ use atat::Error as AtError;
 use atat::asynch::AtatClient;
 use embassy_futures::select::{Either, select};
 use embassy_rp::gpio::Output;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embedded_io_async::Write;
 
 use crate::UrcSub;
@@ -73,11 +73,11 @@ pub async fn power_on(pwrkey: &mut Output<'_>) {
     Timer::after(Duration::from_secs(3)).await;
 }
 
-/// Полная инициализация: от «модуль отвечает» до `CONNECT`.
+/// Довести модем до состояния «можно звонить»: связь, SIM, регистрация,
+/// PDP-контекст, attach к GPRS.
 ///
-/// После успешного возврата UART находится в data-режиме и его нужно отдать
-/// [`embassy_net_ppp::Runner::run`].
-pub async fn bring_up<A: AtatClient>(
+/// Дозвон сюда не входит — см. [`dial`].
+pub async fn prepare<A: AtatClient>(
     client: &mut A,
     apn: &str,
     urc: &mut UrcSub,
@@ -145,6 +145,14 @@ pub async fn bring_up<A: AtatClient>(
     //    Ошибку игнорируем: если стек и не поднимался, будет ERROR, и это норма.
     let _ = client.send(&ShutIpStack).await;
 
+    Ok(())
+}
+
+/// Дозвон в PPP: `ATD*99***1#`.
+///
+/// Вынесен из [`prepare`] отдельно, потому что на пути с мультиплексором
+/// уходит не в тот же поток, а в свой логический канал.
+pub async fn dial<A: AtatClient>(client: &mut A) -> Result<(), BringUpError> {
     // 9. Дозвон. Ответ `CONNECT` дайджестер atat считает успехом.
     info!("SIM800L: дозвон {}", config::DIAL_STRING);
     client
@@ -167,8 +175,6 @@ pub async fn bring_up<A: AtatClient>(
 /// передать насосу из [`crate::cmux_transport`], а `atat` посадить на
 /// логический канал. Вызывать в самом конце настройки — всё, что удобнее
 /// сделать простыми AT-командами, должно быть сделано до.
-// allow(dead_code): вызывается только на пути с мультиплексором.
-#[allow(dead_code)]
 pub async fn enter_cmux<A: AtatClient>(client: &mut A, n1: u16) -> Result<(), BringUpError> {
     info!("SIM800L: переходим в мультиплексный режим, N1 = {}", n1);
     client
@@ -184,6 +190,19 @@ pub async fn enter_cmux<A: AtatClient>(client: &mut A, n1: u16) -> Result<(), Br
             BringUpError::CmuxRefused
         })?;
     Ok(())
+}
+
+/// Полная инициализация: от «модуль отвечает» до `CONNECT`.
+///
+/// После успешного возврата UART находится в data-режиме и его нужно отдать
+/// [`embassy_net_ppp::Runner::run`].
+pub async fn bring_up<A: AtatClient>(
+    client: &mut A,
+    apn: &str,
+    urc: &mut UrcSub,
+) -> Result<(), BringUpError> {
+    prepare(client, apn, urc).await?;
+    dial(client).await
 }
 
 /// Дожидаемся ответа на `AT`. Модуль может ещё грузиться после подачи питания.
@@ -369,6 +388,61 @@ async fn attach_gprs<A: AtatClient>(client: &mut A) -> Result<(), BringUpError> 
         Timer::after(Duration::from_secs(2)).await;
     }
     Err(BringUpError::NotAttached)
+}
+
+/// Дозвон прямо в поток, без `atat`.
+///
+/// На пути с мультиплексором `ATD` уходит в свой логический канал, где своего
+/// разборщика ответов нет. Городить второй экземпляр `atat` ради одной команды
+/// незачем: достаточно дождаться в потоке подстроки `CONNECT`.
+///
+/// Всё, что придёт до неё (эхо, `RING`, пустые строки), просто проматывается.
+pub async fn dial_on_stream<S>(
+    stream: &mut S,
+    dial: &str,
+    timeout: Duration,
+) -> Result<(), BringUpError>
+where
+    S: embedded_io_async::Read + Write,
+{
+    const TOKEN: &[u8] = b"CONNECT";
+
+    info!("SIM800L: дозвон {} в канал", dial);
+    let mut line = heapless::String::<32>::new();
+    let _ = core::fmt::Write::write_fmt(&mut line, format_args!("ATD{dial}\r"));
+    stream
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|_| BringUpError::DialFailed)?;
+
+    let deadline = Instant::now() + timeout;
+    let mut matched = 0usize;
+    let mut buf = [0u8; 32];
+
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let Ok(read) = with_timeout(remaining, stream.read(&mut buf)).await else {
+            break;
+        };
+        let n = read.map_err(|_| BringUpError::DialFailed)?;
+
+        for &byte in &buf[..n] {
+            matched = if byte == TOKEN[matched] {
+                matched + 1
+            } else if byte == TOKEN[0] {
+                1
+            } else {
+                0
+            };
+            if matched == TOKEN.len() {
+                info!("SIM800L: CONNECT в канале — переходим в PPP");
+                return Ok(());
+            }
+        }
+    }
+
+    warn!("SIM800L: CONNECT в канале не дождались");
+    Err(BringUpError::DialFailed)
 }
 
 /// Возврат из data-режима в командный: `+++` с охранными паузами, затем `ATH`.
