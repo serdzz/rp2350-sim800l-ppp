@@ -14,6 +14,10 @@ pub mod modem;
 #[path = "../../src/lipo.rs"]
 pub mod lipo;
 
+/// Фрейминг CMUX. Тесты живут внутри самого модуля.
+#[path = "../../src/cmux.rs"]
+pub mod cmux;
+
 #[cfg(test)]
 mod tests {
     use super::modem::*;
