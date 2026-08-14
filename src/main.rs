@@ -25,6 +25,7 @@ mod fmt;
 mod app;
 mod battery;
 mod cmux;
+mod cmux_transport;
 mod config;
 mod io_compat;
 mod lipo;

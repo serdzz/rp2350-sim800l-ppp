@@ -89,6 +89,7 @@ pub fn fcs(data: &[u8]) -> u8 {
 
 /// Тип кадра, таблица 2 спецификации. Бит P/F хранится отдельно.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "_defmt", derive(defmt::Format))]
 pub enum FrameKind {
     /// Установить режим — открывает канал.
     Sabm,
@@ -140,6 +141,7 @@ impl FrameKind {
 
 /// Адресное поле: идентификатор канала и признак команды.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "_defmt", derive(defmt::Format))]
 pub struct Address {
     /// Номер логического канала, 0..=63. Канал 0 — управляющий.
     pub dlci: u8,
@@ -168,6 +170,7 @@ impl Address {
 
 /// Разобранный или собираемый кадр.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "_defmt", derive(defmt::Format))]
 pub struct Frame<'a> {
     pub address: Address,
     pub kind: FrameKind,
@@ -179,6 +182,7 @@ pub struct Frame<'a> {
 
 /// Почему не удалось собрать кадр.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "_defmt", derive(defmt::Format))]
 pub enum EncodeError {
     /// Выходной буфер меньше [`Frame::encoded_len`].
     BufferTooSmall,
@@ -190,6 +194,7 @@ pub enum EncodeError {
 
 /// Почему кадр отброшен при разборе.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "_defmt", derive(defmt::Format))]
 pub enum DecodeError {
     /// Контрольная сумма не сошлась.
     Fcs,
@@ -512,6 +517,71 @@ impl<'a> Frame<'a> {
     }
 }
 
+/// Заголовок и хвост UIH-кадра для потоковой отправки.
+///
+/// Даёт отправить кадр тремя записями — заголовок, полезная нагрузка, хвост —
+/// не собирая его целиком в буфере. Для PPP это принципиально: иначе на каждый
+/// канал пришлось бы держать буфер на полтора килобайта только под отправку.
+///
+/// Работает лишь для UIH и ровно по той причине, что описана в шапке модуля:
+/// его FCS не покрывает поле данных (§5.2.1.6), поэтому контрольную сумму
+/// можно досчитать до того, как данные уйдут в линию. Для UI такой приём
+/// невозможен.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "_defmt", derive(defmt::Format))]
+pub struct UihFraming {
+    header: [u8; 5],
+    header_len: u8,
+    trailer: [u8; 2],
+}
+
+impl UihFraming {
+    /// Подготовить обвязку для кадра на `dlci` с полем данных длиной `len`.
+    pub fn new(dlci: u8, len: usize) -> Result<Self, EncodeError> {
+        if dlci > 0x3F {
+            return Err(EncodeError::DlciOutOfRange);
+        }
+        if len > MAX_LEN_LONG {
+            return Err(EncodeError::InformationTooLong);
+        }
+
+        let mut header = [0u8; 5];
+        header[0] = FLAG;
+        header[1] = Address {
+            dlci,
+            command: true,
+        }
+        .encode();
+        header[2] = FrameKind::Uih.code();
+
+        let header_len = if len > MAX_LEN_SHORT {
+            header[3] = ((len as u16 & 0x7F) << 1) as u8;
+            header[4] = (len >> 7) as u8;
+            5
+        } else {
+            header[3] = ((len as u8) << 1) | 1;
+            4
+        };
+
+        Ok(Self {
+            header,
+            header_len: header_len as u8,
+            // FCS считается по заголовку без открывающего флага.
+            trailer: [fcs(&header[1..header_len]), FLAG],
+        })
+    }
+
+    /// Байты до полезной нагрузки.
+    pub fn header(&self) -> &[u8] {
+        &self.header[..self.header_len as usize]
+    }
+
+    /// Байты после полезной нагрузки: FCS и закрывающий флаг.
+    pub fn trailer(&self) -> &[u8] {
+        &self.trailer
+    }
+}
+
 /// Сообщения управляющего канала (DLCI 0), §5.4.6.
 ///
 /// Формат «тип — длина — значение». В октете типа: бит 1 — EA, бит 2 — C/R,
@@ -637,6 +707,7 @@ pub mod control {
 
 /// Состояние логического канала.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "_defmt", derive(defmt::Format))]
 pub enum ChannelState {
     Closed,
     /// Отправлен SABM, ждём UA.
@@ -648,6 +719,7 @@ pub enum ChannelState {
 
 /// Почему не удалось начать операцию над каналом.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "_defmt", derive(defmt::Format))]
 pub enum SessionError {
     /// DLCI больше 63.
     DlciOutOfRange,
@@ -656,6 +728,9 @@ pub enum SessionError {
 }
 
 /// Что произошло при получении кадра.
+// defmt::Format здесь не выводится: у типа есть время жизни, и derive не
+// может связать его с сигнатурой format(). Событие всё равно разбирается
+// через match, а не печатается целиком.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event<'a> {
     /// Кадр не потребовал действий.
@@ -1314,6 +1389,36 @@ mod tests {
         let mut s = Session::new();
         assert_eq!(s.on_frame(&Frame::ua(5)), Event::Ignored);
         assert_eq!(s.state(5), ChannelState::Closed);
+    }
+
+    /// Потоковая сборка обязана давать ровно те же байты, что и сборка кадра
+    /// целиком — иначе PPP и AT-канал разойдутся в форматах.
+    #[test]
+    fn streaming_framing_matches_whole_frame_encoding() {
+        for len in [0usize, 1, 5, 126, 127, 128, 512, 1500] {
+            let payload = vec![0x5Au8; len];
+            let whole = encode(&Frame::uih(1, &payload));
+
+            let framing = UihFraming::new(1, len).unwrap();
+            let mut streamed = Vec::new();
+            streamed.extend_from_slice(framing.header());
+            streamed.extend_from_slice(&payload);
+            streamed.extend_from_slice(framing.trailer());
+
+            assert_eq!(streamed, whole, "длина {len}");
+        }
+    }
+
+    #[test]
+    fn streaming_framing_validates_arguments() {
+        assert_eq!(UihFraming::new(64, 0), Err(EncodeError::DlciOutOfRange));
+        assert_eq!(
+            UihFraming::new(1, MAX_LEN_LONG + 1),
+            Err(EncodeError::InformationTooLong)
+        );
+        // Граница перехода на двухоктетную длину видна по размеру заголовка.
+        assert_eq!(UihFraming::new(1, 127).unwrap().header().len(), 4);
+        assert_eq!(UihFraming::new(1, 128).unwrap().header().len(), 5);
     }
 
     /// Октет типа CLD из §5.4.6.3.3: биты 7 и 8 единичные, остальные нули.
