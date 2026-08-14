@@ -133,26 +133,89 @@ async fn sync<A: AtatClient>(client: &mut A) -> Result<(), BringUpError> {
     Err(BringUpError::NoResponse)
 }
 
+/// Расшифровка `<stat>` из `+CREG?` / `+CGREG?` (3GPP TS 27.007).
+///
+/// Именно этот код отвечает на вопрос «почему нет регистрации»: `2` — сеть не
+/// находится (питание, антенна или 2G погашен), `3` — сеть видна, но не пускает
+/// (вопрос к SIM или оператору).
+fn stat_name(stat: Option<u8>) -> &'static str {
+    match stat {
+        Some(0) => "не ищет",
+        Some(1) => "зарегистрирован (дома)",
+        Some(2) => "ищет сеть",
+        Some(3) => "ОТКАЗАНО",
+        Some(4) => "неизвестно",
+        Some(5) => "зарегистрирован (роуминг)",
+        Some(_) => "нерасшифрованный код",
+        None => "нет ответа",
+    }
+}
+
+/// `Option<u8>` в число для лога: -1 = ответа не было.
+///
+/// `Option` нельзя отдать в формат напрямую: `log` требует `Display`, которого
+/// у него нет, а `defmt` — свой `Format`. Через `i16` работают оба бэкенда.
+fn stat_code(stat: Option<u8>) -> i16 {
+    stat.map(i16::from).unwrap_or(-1)
+}
+
+/// `<rssi>` из `+CSQ` в дБм. 99 = «не измерено», отдаём 0.
+fn rssi_dbm(rssi: u8) -> i16 {
+    if rssi >= 99 {
+        0
+    } else {
+        -113 + 2 * rssi as i16
+    }
+}
+
 async fn wait_registration<A: AtatClient>(client: &mut A) -> Result<(), BringUpError> {
     for attempt in 0..config::REGISTRATION_ATTEMPTS {
-        if let Ok(csq) = client.send(&GetSignalQuality).await {
-            debug!("SIM800L: CSQ rssi={} ber={}", csq.rssi, csq.ber);
-        }
-
+        let csq = client.send(&GetSignalQuality).await;
         let gsm = client.send(&GetNetworkRegistration).await;
         let gprs = client.send(&GetGprsRegistration).await;
 
-        let gsm_ok = gsm.as_ref().map(|r| r.is_registered()).unwrap_or(false);
-        let gprs_ok = gprs.as_ref().map(|r| r.is_registered()).unwrap_or(false);
+        let gsm_stat = gsm.as_ref().ok().map(|r| r.stat);
+        let gprs_stat = gprs.as_ref().ok().map(|r| r.stat);
+        let rssi = csq.as_ref().map(|c| c.rssi).unwrap_or(99);
 
-        if gsm_ok && gprs_ok {
+        debug!(
+            "SIM800L: CSQ {} ({} дБм) | CREG {} — {} | CGREG {} — {}",
+            rssi,
+            rssi_dbm(rssi),
+            stat_code(gsm_stat),
+            stat_name(gsm_stat),
+            stat_code(gprs_stat),
+            stat_name(gprs_stat),
+        );
+
+        if matches!(gsm_stat, Some(1) | Some(5)) && matches!(gprs_stat, Some(1) | Some(5)) {
             info!("SIM800L: зарегистрированы (попытка {})", attempt);
             return Ok(());
         }
 
-        debug!("SIM800L: регистрация gsm={} gprs={}", gsm_ok, gprs_ok);
+        // Текущий оператор — редко, команда не бесплатная по времени.
+        if attempt % 5 == 0 {
+            match client.send(&GetOperator).await {
+                Ok(op) => debug!("SIM800L: COPS? -> {}", op.text.as_str()),
+                Err(e) => debug!("SIM800L: COPS? не ответил: {:?}", e),
+            }
+        }
+
         Timer::after(Duration::from_secs(2)).await;
     }
+
+    // Регистрации не случилось — сканируем эфир, чтобы понять, есть ли тут 2G.
+    if config::SCAN_OPERATORS_ON_FAILURE {
+        warn!("SIM800L: регистрации нет; сканирую сети (AT+COPS=?, до 3 мин)…");
+        match client.send(&ScanOperators).await {
+            Ok(list) if list.text.is_empty() => {
+                warn!("SIM800L: сканирование вернуло пустой список — 2G не виден")
+            }
+            Ok(list) => warn!("SIM800L: видимые сети: {}", list.text.as_str()),
+            Err(e) => warn!("SIM800L: сканирование не удалось: {:?}", e),
+        }
+    }
+
     Err(BringUpError::NotRegistered)
 }
 

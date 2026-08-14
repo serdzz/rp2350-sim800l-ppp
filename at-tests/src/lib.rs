@@ -78,6 +78,48 @@ mod tests {
         assert!(DialPpp { number: "*99#" }.parse(Ok(b"")).is_ok());
     }
 
+    /// `AT+COPS?` меняет число полей в зависимости от состояния регистрации,
+    /// поэтому разбирается «как есть». Структура с фиксированными полями
+    /// развалилась бы на первом же варианте.
+    #[test]
+    fn cops_parses_both_shapes() {
+        assert_eq!(ser(&GetOperator), "AT+COPS?\r");
+        assert_eq!(ser(&ScanOperators), "AT+COPS=?\r");
+
+        // Не зарегистрирован — одно поле.
+        let r = GetOperator.parse(Ok(b"+COPS: 0")).unwrap();
+        assert_eq!(r.text.as_str(), "+COPS: 0");
+
+        // Зарегистрирован — три поля.
+        let r = GetOperator.parse(Ok(b"+COPS: 0,0,\"MegaFon\"")).unwrap();
+        assert_eq!(r.text.as_str(), "+COPS: 0,0,\"MegaFon\"");
+
+        // Список сетей от AT+COPS=?
+        let r = ScanOperators
+            .parse(Ok(b"+COPS: (2,\"MegaFon\",\"MegaFon\",\"25002\"),(1,\"MTS\",\"MTS\",\"25001\")"))
+            .unwrap();
+        assert!(r.text.as_str().contains("25002"));
+        assert!(r.text.as_str().contains("MTS"));
+    }
+
+    /// Длинный список сетей обязан обрезаться, а не паниковать.
+    #[test]
+    fn raw_line_truncates_instead_of_panicking() {
+        let long = vec![b'x'; 4096];
+        let r = ScanOperators.parse(Ok(&long)).unwrap();
+        assert_eq!(r.text.len(), 256, "должно обрезаться по вместимости");
+    }
+
+    /// Обрезка не должна разрубать многобайтный символ пополам.
+    #[test]
+    fn raw_line_truncation_keeps_utf8_intact() {
+        let long = "ю".repeat(4096);
+        let r = ScanOperators.parse(Ok(long.as_bytes())).unwrap();
+        // 256-байтный буфер, символ по 2 байта -> 128 символов, 256 байт.
+        assert_eq!(r.text.chars().count(), 128);
+        assert_eq!(r.text.len(), 256);
+    }
+
     #[test]
     fn digester_handles_connect_and_urcs() {
         let mut d = atat::DefaultDigester::<Urc>::default();

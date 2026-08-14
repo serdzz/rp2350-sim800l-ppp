@@ -77,6 +77,35 @@ pub struct InfoText {
     pub text: String<64>,
 }
 
+/// Тело ответа как есть, без разбора на поля.
+///
+/// Нужен там, где формат плавает. Пример — `AT+COPS?`: незарегистрированный
+/// модуль отвечает `+COPS: 0` (одно поле), зарегистрированный —
+/// `+COPS: 0,0,"Operator"` (три). Структура с фиксированным числом полей на
+/// первом варианте развалилась бы с `Error::Parse`.
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "_defmt", derive(defmt::Format))]
+pub struct RawLine {
+    pub text: String<256>,
+}
+
+impl atat::AtatResp for RawLine {}
+
+/// Копирует тело ответа, обрезая по вместимости буфера.
+///
+/// Обрезка — сознательный выбор: список сетей от `AT+COPS=?` бывает длиннее
+/// любого разумного буфера, а для диагностики хватает начала.
+pub fn parse_raw_line(resp: &[u8]) -> Result<RawLine, core::str::Utf8Error> {
+    let s = core::str::from_utf8(resp)?;
+    let mut text = String::new();
+    for c in s.chars() {
+        if text.push(c).is_err() {
+            break;
+        }
+    }
+    Ok(RawLine { text })
+}
+
 // ---------------------------------------------------------------------------
 // Команды
 // ---------------------------------------------------------------------------
@@ -134,6 +163,21 @@ pub struct GetNetworkRegistration;
 #[derive(Clone, AtatCmd)]
 #[at_cmd("+CGREG?", RegistrationStatus, timeout_ms = 2_000)]
 pub struct GetGprsRegistration;
+
+/// `AT+COPS?` — на какой сети мы сейчас.
+///
+/// Ответ разбирается «как есть»: у незарегистрированного модуля полей меньше.
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+COPS?", RawLine, parse = parse_raw_line, timeout_ms = 10_000)]
+pub struct GetOperator;
+
+/// `AT+COPS=?` — поиск всех видимых сетей.
+///
+/// Тяжёлая команда: модуль сканирует эфир и молчит до минуты, иногда дольше.
+/// Зато это единственный прямой ответ на вопрос «а 2G тут вообще есть».
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+COPS=?", RawLine, parse = parse_raw_line, timeout_ms = 180_000)]
+pub struct ScanOperators;
 
 /// `AT+CGDCONT=<cid>,"<pdp_type>","<apn>"` — определить PDP-контекст.
 #[derive(Clone, AtatCmd)]
