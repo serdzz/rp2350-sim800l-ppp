@@ -1,6 +1,8 @@
 //! Управление модулем SIM800L: питание, последовательность AT-инициализации,
 //! вход и выход из PPP (data) режима.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use atat::Error as AtError;
 use atat::asynch::AtatClient;
 use embassy_futures::select::{Either, select};
@@ -11,6 +13,15 @@ use embedded_io_async::Write;
 use crate::UrcSub;
 use crate::config;
 use crate::modem::*;
+
+/// Настройки уже записаны в NV-память модуля в этом сеансе работы MCU.
+///
+/// `AT&W` расходует ресурс перезаписи, а цикл переподключения при просадке
+/// питания повторяется каждые несколько секунд — запись на каждом витке
+/// быстро израсходовала бы ресурс. Одного раза за загрузку контроллера
+/// достаточно: после успешной записи модуль держит `ATE0` и `AT+IPR` сам,
+/// в том числе после аварийного сброса.
+static SETTINGS_SAVED: AtomicBool = AtomicBool::new(false);
 
 /// Что могло пойти не так при подъёме канала.
 // allow(dead_code): поле `At(AtError)` читается только через `{:?}` в логе,
@@ -82,6 +93,18 @@ pub async fn bring_up<A: AtatClient>(
             rate: config::UART_BAUDRATE,
         })
         .await;
+
+    // 2a. Закрепляем скорость и эхо в профиле модуля, иначе после сброса по
+    //     питанию он вернётся в автобод и начнёт отвечать на чужой скорости.
+    if !SETTINGS_SAVED.load(Ordering::Relaxed) {
+        match client.send(&SaveSettings).await {
+            Ok(_) => {
+                SETTINGS_SAVED.store(true, Ordering::Relaxed);
+                info!("SIM800L: настройки закреплены в профиле (AT&W)");
+            }
+            Err(e) => warn!("SIM800L: AT&W не выполнен: {:?}", e),
+        }
+    }
 
     // 3. Радиотракт в полную функциональность.
     let _ = client.send(&SetFunctionality { fun: 1 }).await;
@@ -208,10 +231,29 @@ fn rssi_dbm(rssi: u8) -> i16 {
     }
 }
 
-/// Ждёт `RDY` — незапрошенный признак того, что модуль загрузился заново.
+/// Признак того, что модуль пережил незапланированную перезагрузку.
+///
+/// `RDY` однозначен, но после провала питания приходит битым и до URC-канала
+/// доезжает примерно в одном случае из пяти — на живом стенде это 3 пойманных
+/// сброса из 14. `Call Ready` / `SMS Ready` ловятся почти всегда, но их же
+/// модуль шлёт и при нормальном старте, уже после того как мы вычистили
+/// очередь URC. Цена — один лишний цикл инициализации (~13 с) при первом
+/// подключении; дальше модуль их не повторяет. Отключается в [`config`].
+///
+/// `NORMAL POWER DOWN` при штатной работе не приходит вовсе, поэтому включён
+/// всегда.
+fn is_reset_urc(urc: &Urc) -> bool {
+    match urc {
+        Urc::Ready | Urc::PowerDown => true,
+        Urc::CallReady | Urc::SmsReady => config::TREAT_READY_URCS_AS_RESET,
+        Urc::PdpDeactivated => false,
+    }
+}
+
+/// Ждёт признака того, что модуль загрузился заново.
 async fn wait_for_modem_reset(urc: &mut UrcSub) {
     loop {
-        if matches!(urc.next_message_pure().await, Urc::Ready) {
+        if is_reset_urc(&urc.next_message_pure().await) {
             return;
         }
     }

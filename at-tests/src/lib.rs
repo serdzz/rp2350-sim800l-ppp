@@ -39,6 +39,8 @@ mod tests {
         assert_eq!(ser(&GetGprsAttach), "AT+CGATT?\r");
         assert_eq!(ser(&SetGprsAttach { state: 1 }), "AT+CGATT=1\r");
         assert_eq!(ser(&ShutIpStack), "AT+CIPSHUT\r");
+        // Префикс "AT" + "&W", без знака "=" — полей у команды нет.
+        assert_eq!(ser(&SaveSettings), "AT&W\r");
         assert_eq!(
             ser(&SetPdpContext {
                 cid: 1,
