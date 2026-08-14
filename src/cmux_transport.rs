@@ -251,6 +251,67 @@ pub async fn close_multiplexer<T: Write>(tx: &SharedTx<T>) -> Result<(), Error> 
     send_control_message(tx, control::CLD, true, &[]).await
 }
 
+/// Разобрать и обслужить сообщение, пришедшее по управляющему каналу.
+///
+/// По §5.4.6.2 сообщения ходят парами команда-ответ, и **ответ несёт те же
+/// биты типа, что и команда**. Поэтому отвечаем, не полагаясь на таблицу
+/// известных типов: даже незнакомую команду можно корректно отбить.
+///
+/// Управление потоком (`FCon`/`FCoff`) пока только показывается в логе, но не
+/// исполняется: остановка передачи по всем каналам, кроме нулевого, — это
+/// отдельная работа в [`Channel::write`].
+async fn handle_control_message<T: Write>(tx: &SharedTx<T>, payload: &[u8]) {
+    let Some((bits, command, value)) = control::decode(payload) else {
+        warn!("CMUX: неразбираемое сообщение управляющего канала");
+        return;
+    };
+
+    if !command {
+        debug!("CMUX: ответ управляющего канала, тип 0x{:02x}", bits);
+        return;
+    }
+
+    let reply = match bits {
+        control::MSC => {
+            // §5.4.6.3.7: в ответе возвращаются те же сигналы, что пришли.
+            if let Some(&dlci_octet) = value.first() {
+                debug!("CMUX: MSC для DLCI {}", dlci_octet >> 2);
+            }
+            Some(value)
+        }
+        control::CLD => {
+            warn!("CMUX: модем закрывает мультиплексор (CLD)");
+            Some(&[][..])
+        }
+        control::FCON => {
+            info!("CMUX: модем снял стоп потока (FCon)");
+            Some(&[][..])
+        }
+        control::FCOFF => {
+            warn!("CMUX: модем просит остановить поток (FCoff) — не исполняется");
+            Some(&[][..])
+        }
+        other => {
+            warn!("CMUX: неизвестная управляющая команда 0x{:02x}", other);
+            // Отвечаем NSC, вложив октет типа непонятой команды (§5.4.6.3.8).
+            let unsupported = [control::type_octet(other, true)];
+            if send_control_message(tx, control::NSC, false, &unsupported)
+                .await
+                .is_err()
+            {
+                warn!("CMUX: не удалось отправить NSC");
+            }
+            None
+        }
+    };
+
+    if let Some(value) = reply
+        && send_control_message(tx, bits, false, value).await.is_err()
+    {
+        warn!("CMUX: не удалось ответить по управляющему каналу");
+    }
+}
+
 /// Что помешало поднять мультиплексор.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "_defmt", derive(defmt::Format))]
@@ -419,11 +480,18 @@ where
             };
 
             match event {
+                // Нулевой канал служебный: его содержимое — не данные
+                // потребителя, а сообщения самого мультиплексора.
+                Event::Data { dlci, payload } if dlci == CONTROL_DLCI => {
+                    handle_control_message(tx, payload).await
+                }
                 Event::Data { dlci, payload } => match routes.iter().find(|r| r.dlci == dlci) {
                     Some(route) => write_all(&route.sink, payload).await,
                     None => debug!("CMUX: данные для незанятого DLCI {}", dlci),
                 },
-                Event::Opened(dlci) => info!("CMUX: канал {} открыт", dlci),
+                // Об успешном открытии докладывает open_channel — здесь только
+                // отладочный след, иначе строка двоится.
+                Event::Opened(dlci) => debug!("CMUX: подтверждение открытия канала {}", dlci),
                 Event::Closed(dlci) => info!("CMUX: канал {} закрыт", dlci),
                 Event::RemoteOpen { dlci, reply } | Event::RemoteDisconnect { dlci, reply } => {
                     info!("CMUX: модем изменил состояние канала {}", dlci);

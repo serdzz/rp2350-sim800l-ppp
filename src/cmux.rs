@@ -592,6 +592,14 @@ impl UihFraming {
 pub mod control {
     /// Multiplexer close down — вернуть линию в обычный AT-режим (§5.4.6.3.3).
     pub const CLD: u8 = 0x30;
+    /// Flow Control On — встречная сторона снова принимает данные (§5.4.6.3.5).
+    pub const FCON: u8 = 0x28;
+    /// Flow Control Off — принимать данные нельзя, кроме управляющего канала
+    /// (§5.4.6.3.6).
+    pub const FCOFF: u8 = 0x18;
+    /// Non Supported Command — ответ на неизвестную команду (§5.4.6.3.8).
+    /// Значение — октет типа той команды, которую не поняли.
+    pub const NSC: u8 = 0x04;
     /// Modem Status Command — передача виртуальных сигналов V.24 (§5.4.6.3.7).
     ///
     /// Спецификация требует слать его до любых пользовательских данных сразу
@@ -1461,6 +1469,19 @@ mod tests {
         assert_eq!(control::type_octet(control::CLD, false), 0xC1);
         assert_eq!(control::type_octet(control::MSC, true), 0xE3);
         assert_eq!(control::type_octet(control::MSC, false), 0xE1);
+        assert_eq!(control::type_octet(control::FCON, true), 0xA3);
+        assert_eq!(control::type_octet(control::FCOFF, true), 0x63);
+        assert_eq!(control::type_octet(control::NSC, false), 0x11);
+
+        // §5.4.6.2: ответ несёт те же биты типа, что и команда, — на этом
+        // построен разбор в cmux_transport, и он не зависит от таблицы выше.
+        for bits in [control::CLD, control::MSC, control::FCON, control::FCOFF] {
+            let command = control::type_octet(bits, true);
+            let response = control::type_octet(bits, false);
+            assert_eq!(command >> 2, response >> 2);
+            assert_eq!(command & 0b10, 0b10);
+            assert_eq!(response & 0b10, 0);
+        }
     }
 
     #[test]
