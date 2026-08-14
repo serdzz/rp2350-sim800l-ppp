@@ -152,6 +152,71 @@ mod tests {
         assert_eq!(r.text.len(), 256);
     }
 
+    /// Ровно тот баг, что уронил дозвон на живом стенде: `AT+CIPSHUT`
+    /// отвечает `SHUT OK`, штатный дайджестер такой ответ не признаёт,
+    /// строка остаётся в буфере и приклеивается к следующей команде.
+    #[test]
+    fn shut_ok_is_recognised_as_success() {
+        let mut d = atat::DefaultDigester::<Urc>::new().with_custom_success(parse_shut_ok);
+
+        // Сам по себе SHUT OK — успех с пустым телом.
+        let (res, used) = d.digest(b"\r\nSHUT OK\r\n");
+        match res {
+            DigestResult::Response(Ok(body)) => assert!(body.is_empty()),
+            other => panic!("{:?}", other),
+        }
+        assert_eq!(used, 11, "токен должен быть съеден целиком");
+
+        // NoResponse обязан разобраться из пустого тела.
+        assert!(ShutIpStack.parse(Ok(b"")).is_ok());
+
+        // Без парсера тот же ввод не распознаётся вовсе — это и есть причина
+        // залипания в буфере.
+        let mut plain = atat::DefaultDigester::<Urc>::new();
+        let (res, used) = plain.digest(b"\r\nSHUT OK\r\n");
+        assert!(matches!(res, DigestResult::None), "{:?}", res);
+        assert_eq!(used, 0, "байты остались бы в буфере");
+
+        // Обычные ответы после добавления парсера не сломались.
+        let (res, _) = d.digest(b"\r\n+CSQ: 24,0\r\n\r\nOK\r\n");
+        match res {
+            DigestResult::Response(Ok(body)) => assert_eq!(body, b"+CSQ: 24,0"),
+            other => panic!("{:?}", other),
+        }
+        let (res, _) = d.digest(b"\r\nCONNECT\r\n");
+        assert!(matches!(res, DigestResult::Response(Ok(_))), "{:?}", res);
+    }
+
+    /// Воспроизведение сбоя: хвост `SHUT OK` перед ответом на дозвон.
+    #[test]
+    fn stale_shut_ok_would_break_the_next_command() {
+        // Без парсера тело ответа на дозвон приезжает как "SHUT OK" -> Error::Parse.
+        let mut plain = atat::DefaultDigester::<Urc>::new();
+        let (res, _) = plain.digest(b"\r\nSHUT OK\r\n\r\nCONNECT\r\n");
+        match res {
+            DigestResult::Response(Ok(body)) => {
+                assert_eq!(body, b"SHUT OK");
+                assert!(
+                    DialPpp { number: "*99#" }.parse(Ok(body)).is_err(),
+                    "именно так дозвон и падал с Parse"
+                );
+            }
+            other => panic!("{:?}", other),
+        }
+
+        // С парсером SHUT OK съедается отдельно, дозвон получает чистый CONNECT.
+        let mut d = atat::DefaultDigester::<Urc>::new().with_custom_success(parse_shut_ok);
+        let (_, used) = d.digest(b"\r\nSHUT OK\r\n\r\nCONNECT\r\n");
+        let (res, _) = d.digest(&b"\r\nSHUT OK\r\n\r\nCONNECT\r\n"[used..]);
+        match res {
+            DigestResult::Response(Ok(body)) => {
+                assert!(body.is_empty());
+                assert!(DialPpp { number: "*99#" }.parse(Ok(body)).is_ok());
+            }
+            other => panic!("{:?}", other),
+        }
+    }
+
     #[test]
     fn digester_handles_connect_and_urcs() {
         let mut d = atat::DefaultDigester::<Urc>::default();

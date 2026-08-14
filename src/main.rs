@@ -200,8 +200,10 @@ async fn main(spawner: Spawner) {
     static INGRESS_BUF: StaticCell<[u8; INGRESS_BUF_SIZE]> = StaticCell::new();
     static CMD_BUF: StaticCell<[u8; CMD_BUF_SIZE]> = StaticCell::new();
 
+    // with_custom_success: SIM800L отвечает на AT+CIPSHUT строкой `SHUT OK`,
+    // которую штатный дайджестер не считает успехом — см. modem::parse_shut_ok.
     let mut ingress = Ingress::new(
-        DefaultDigester::<Urc>::default(),
+        DefaultDigester::<Urc>::new().with_custom_success(modem::parse_shut_ok),
         INGRESS_BUF.init([0; INGRESS_BUF_SIZE]),
         &RES_SLOT,
         &URC_CHANNEL,

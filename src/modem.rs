@@ -257,6 +257,26 @@ pub struct GetGprsAttach;
 #[at_cmd("+CIPSHUT", NoResponse, timeout_ms = 65_000)]
 pub struct ShutIpStack;
 
+/// Распознаёт `SHUT OK` — нестандартный успешный ответ на `AT+CIPSHUT`.
+///
+/// Дайджестер `atat` знает только `OK` и `CONNECT`. Строка `\r\nSHUT OK\r\n`
+/// не содержит `\r\nOK\r\n` как подстроку, поэтому без этого парсера она
+/// остаётся в приёмном буфере: команда отваливается по таймауту (а он у
+/// `AT+CIPSHUT` — 65 с), после чего «хвост» приклеивается к ответу на
+/// следующую команду и ломает её разбор с `Error::Parse`.
+///
+/// Тело ответа возвращаем пустым: важен только сам факт успеха, а `NoResponse`
+/// ничего другого и не ждёт. Требуем совпадения строго с начала буфера, чтобы
+/// не проглотить чужой ответ, стоящий перед токеном.
+pub fn parse_shut_ok(buf: &[u8]) -> Result<(&[u8], usize), atat::digest::ParseError> {
+    const TOKEN: &[u8] = b"\r\nSHUT OK\r\n";
+    if buf.starts_with(TOKEN) {
+        Ok((&buf[..0], TOKEN.len()))
+    } else {
+        Err(atat::digest::ParseError::NoMatch)
+    }
+}
+
 /// `ATD*99***1#` — уйти в data-режим. Успешный ответ — `CONNECT`,
 /// его дайджестер `atat` трактует как успех наравне с `OK`.
 ///
