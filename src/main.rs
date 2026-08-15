@@ -28,6 +28,7 @@ mod cmux;
 mod cmux_transport;
 mod config;
 mod io_compat;
+mod led;
 mod lipo;
 mod modem;
 mod mqtt;
@@ -211,12 +212,9 @@ async fn main(spawner: Spawner) {
     spawner.spawn(unwrap!(net_task(net_runner)));
     spawner.spawn(unwrap!(urc_task(unwrap!(URC_CHANNEL.subscribe().ok()))));
     spawner.spawn(unwrap!(app::demo_task(stack)));
-    // Зелёный светодиод на GP25 (через R19 470R на землю, активен высоким):
-    // горит, пока держится соединение с брокером.
-    spawner.spawn(unwrap!(mqtt::mqtt_task(
-        stack,
-        Output::new(p.PIN_25, Level::Low)
-    )));
+    // Зелёный светодиод на GP25 — через R19 470R на землю, активен высоким.
+    spawner.spawn(unwrap!(led::led_task(Output::new(p.PIN_25, Level::Low))));
+    spawner.spawn(unwrap!(mqtt::mqtt_task(stack)));
 
     // --- atat: ingress + буфер команд -------------------------------------
     static INGRESS_BUF: StaticCell<[u8; INGRESS_BUF_SIZE]> = StaticCell::new();

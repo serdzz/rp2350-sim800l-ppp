@@ -1,12 +1,13 @@
 //! Телеметрия по MQTT поверх поднятого PPP-канала.
 //!
 //! Раз в [`config::MQTT_PUBLISH_SECS`] публикуется уровень сигнала в
-//! [`config::MQTT_TOPIC_CSQ`]. Зелёный светодиод на GP25 управляется извне:
-//! команда `ON` или `OFF` в [`config::MQTT_TOPIC_LED`].
+//! [`config::MQTT_TOPIC_CSQ`]. Зелёный светодиод управляется извне: команда
+//! `ON`, `OFF` или `BLINK` в [`config::MQTT_TOPIC_LED`].
 //!
-//! Состояние светодиода задаётся только командами и переживает переподключение
-//! к брокеру: гасить его при обрыве значило бы врать о состоянии, которое
-//! никто не менял.
+//! Сам светодиод живёт в [`crate::led`] — здесь только разбор команды. Режим
+//! задаётся исключительно командами и переживает переподключение к брокеру:
+//! гасить светодиод при обрыве значило бы врать о состоянии, которое никто
+//! не менял.
 //!
 //! # Откуда берётся CSQ
 //!
@@ -34,7 +35,6 @@ use embassy_futures::select::{Either, select};
 use embassy_net::Stack;
 use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
-use embassy_rp::gpio::Output;
 use embassy_time::{Duration, Instant, Timer};
 use rust_mqtt::buffer::BumpBuffer;
 use rust_mqtt::client::Client;
@@ -46,6 +46,7 @@ use rust_mqtt::config::{KeepAlive, SessionExpiryInterval};
 use rust_mqtt::types::{MqttString, TopicName};
 
 use crate::config;
+use crate::led;
 
 /// Последний измеренный уровень сигнала. 99 — «не измерено», как в `+CSQ`.
 ///
@@ -65,7 +66,7 @@ const KEEP_ALIVE_SECS: u16 = 120;
 
 /// Публикация телеметрии и индикация связи светодиодом.
 #[embassy_executor::task]
-pub async fn mqtt_task(stack: Stack<'static>, mut led: Output<'static>) -> ! {
+pub async fn mqtt_task(stack: Stack<'static>) -> ! {
     let mut rx_buffer = [0u8; 1024];
     let mut tx_buffer = [0u8; 1024];
     let mut storage = [0u8; MQTT_BUFFER];
@@ -73,15 +74,7 @@ pub async fn mqtt_task(stack: Stack<'static>, mut led: Output<'static>) -> ! {
     loop {
         stack.wait_config_up().await;
 
-        if let Err(()) = session(
-            stack,
-            &mut led,
-            &mut rx_buffer,
-            &mut tx_buffer,
-            &mut storage,
-        )
-        .await
-        {
+        if let Err(()) = session(stack, &mut rx_buffer, &mut tx_buffer, &mut storage).await {
             Timer::after(RETRY_DELAY).await;
         }
     }
@@ -93,7 +86,6 @@ pub async fn mqtt_task(stack: Stack<'static>, mut led: Output<'static>) -> ! {
 /// светодиод и переподключиться, а подробности уходят в лог.
 async fn session(
     stack: Stack<'static>,
-    led: &mut Output<'static>,
     rx_buffer: &mut [u8],
     tx_buffer: &mut [u8],
     storage: &mut [u8],
@@ -189,7 +181,7 @@ async fn session(
             Either::Second(event) => {
                 let event = event.map_err(|e| warn!("MQTT: соединение потеряно: {:?}", e))?;
                 match event {
-                    Event::Publish(publication) => apply_led_command(led, &publication.message),
+                    Event::Publish(publication) => apply_led_command(&publication.message),
                     other => debug!("MQTT: событие {:?}", other),
                 }
             }
@@ -197,23 +189,27 @@ async fn session(
     }
 }
 
-/// Исполнить команду светодиода: `ON` или `OFF`.
+/// Разобрать команду светодиода: `ON`, `OFF` или `BLINK`.
 ///
-/// Регистр и обрамляющие пробелы игнорируются — брокеры и клиенты шлют
-/// по-разному, а спорить об этом дешевле один раз здесь.
-fn apply_led_command(led: &mut Output<'static>, payload: &[u8]) {
+/// Регистр и обрамляющие пробелы игнорируются — клиенты и брокеры шлют
+/// по-разному, и договориться об этом дешевле один раз здесь.
+fn apply_led_command(payload: &[u8]) {
     let trimmed = payload.trim_ascii();
 
-    if trimmed.eq_ignore_ascii_case(b"ON") {
-        led.set_high();
-        info!("MQTT: светодиод включён");
+    let mode = if trimmed.eq_ignore_ascii_case(b"ON") {
+        led::Mode::On
     } else if trimmed.eq_ignore_ascii_case(b"OFF") {
-        led.set_low();
-        info!("MQTT: светодиод выключен");
+        led::Mode::Off
+    } else if trimmed.eq_ignore_ascii_case(b"BLINK") {
+        led::Mode::Blink
     } else {
         warn!(
-            "MQTT: непонятная команда светодиода ({} байт), ожидается ON или OFF",
+            "MQTT: непонятная команда светодиода ({} байт), ожидается ON, OFF или BLINK",
             trimmed.len()
         );
-    }
+        return;
+    };
+
+    led::set_mode(mode);
+    info!("MQTT: светодиод -> {:?}", mode);
 }
