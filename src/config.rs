@@ -59,6 +59,19 @@ pub const CMUX_OPEN_ATTEMPTS: u32 = 5;
 /// Пауза перед повторной попыткой после развала PPP-сессии.
 pub const RECONNECT_DELAY_SECS: u64 = 10;
 
+// --- MQTT ---
+
+/// Брокер. Публичный тестовый: подключается без учётных данных, удобно для
+/// проверки. Для чего-то настоящего поставьте свой.
+pub const MQTT_HOST: &str = "test.mosquitto.org";
+pub const MQTT_PORT: u16 = 1883;
+/// Идентификатор клиента — должен быть уникален в пределах брокера.
+pub const MQTT_CLIENT_ID: &str = "rp2350-sim800l";
+/// Топик для уровня сигнала.
+pub const MQTT_TOPIC_CSQ: &str = "rp2350-sim800l/csq";
+/// Как часто публиковать CSQ.
+pub const MQTT_PUBLISH_SECS: u64 = 60;
+
 /// Хост для демо-запроса после подъёма IP.
 pub const DEMO_HOST: &str = "example.com";
 pub const DEMO_PORT: u16 = 80;
