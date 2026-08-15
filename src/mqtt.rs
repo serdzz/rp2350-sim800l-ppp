@@ -31,10 +31,12 @@
 
 use core::sync::atomic::{AtomicU8, Ordering};
 
-use embassy_futures::select::{Either, select};
+use embassy_futures::select::{Either3, select3};
 use embassy_net::Stack;
 use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
 use rust_mqtt::buffer::BumpBuffer;
 use rust_mqtt::client::Client;
@@ -47,6 +49,17 @@ use rust_mqtt::types::{MqttString, TopicName};
 
 use crate::config;
 use crate::led;
+
+/// Принятое SMS, ожидающее публикации.
+pub type SmsText = heapless::String<384>;
+
+/// Очередь SMS от AT-канала к брокеру.
+///
+/// Очередь, а не общая ячейка: сообщения нельзя терять и нельзя заставлять
+/// модем ждать, пока GPRS отдаст публикацию. Отправитель кладёт без блокировки
+/// и роняет сообщение, если очередь переполнена — лучше потерять одно SMS,
+/// чем застопорить разбор AT-канала.
+pub static SMS_QUEUE: Channel<CriticalSectionRawMutex, SmsText, 4> = Channel::new();
 
 /// Последний измеренный уровень сигнала. 99 — «не измерено», как в `+CSQ`.
 ///
@@ -155,9 +168,15 @@ async fn session(
     // сдвигать момент следующей публикации.
     let mut deadline = Instant::now();
 
+    let sms_topic = TopicName::new(
+        MqttString::try_from(config::MQTT_TOPIC_SMS)
+            .map_err(|_| warn!("MQTT: слишком длинный топик SMS"))?,
+    )
+    .ok_or_else(|| warn!("MQTT: недопустимый топик SMS"))?;
+
     loop {
-        match select(Timer::at(deadline), client.poll()).await {
-            Either::First(()) => {
+        match select3(Timer::at(deadline), client.poll(), SMS_QUEUE.receive()).await {
+            Either3::First(()) => {
                 let csq = LAST_CSQ.load(Ordering::Relaxed);
                 let mut payload = heapless::String::<8>::new();
                 let _ = core::fmt::Write::write_fmt(&mut payload, format_args!("{csq}"));
@@ -178,12 +197,28 @@ async fn session(
 
                 deadline = Instant::now() + Duration::from_secs(config::MQTT_PUBLISH_SECS);
             }
-            Either::Second(event) => {
+            Either3::Second(event) => {
                 let event = event.map_err(|e| warn!("MQTT: соединение потеряно: {:?}", e))?;
                 match event {
                     Event::Publish(publication) => apply_led_command(&publication.message),
                     other => debug!("MQTT: событие {:?}", other),
                 }
+            }
+            Either3::Third(sms) => {
+                client
+                    .publish(
+                        &PublicationOptions::new(TopicReference::Name(sms_topic.as_borrowed())),
+                        sms.as_bytes().into(),
+                    )
+                    .await
+                    .map_err(|e| warn!("MQTT: SMS не опубликовано: {:?}", e))?;
+                info!(
+                    "MQTT: {} <- SMS ({} байт)",
+                    config::MQTT_TOPIC_SMS,
+                    sms.len()
+                );
+                // SAFETY: заимствований из буфера после публикации нет.
+                unsafe { client.buffer_mut().reset() };
             }
         }
     }

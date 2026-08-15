@@ -73,7 +73,9 @@ pub const MQTT_PORT: u16 = 1883;
 pub const MQTT_CLIENT_ID: &str = "rp2350-sim800l";
 /// Топик для уровня сигнала (публикуем).
 pub const MQTT_TOPIC_CSQ: &str = "rp2350-sim800l/csq";
-/// Топик управления светодиодом (подписываемся). Тело: `ON` или `OFF`.
+/// Топик для принятых SMS (публикуем).
+pub const MQTT_TOPIC_SMS: &str = "rp2350-sim800l/sms";
+/// Топик управления светодиодом (подписываемся). Тело: `ON`, `OFF` или `BLINK`.
 pub const MQTT_TOPIC_LED: &str = "rp2350-sim800l/led";
 /// Как часто публиковать CSQ.
 pub const MQTT_PUBLISH_SECS: u64 = 60;

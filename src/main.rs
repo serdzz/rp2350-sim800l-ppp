@@ -52,7 +52,7 @@ use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartCon
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::pipe::{DynamicReader, DynamicWriter, Pipe};
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use static_cell::StaticCell;
 
 #[cfg(feature = "log-rtt")]
@@ -72,8 +72,9 @@ use crate::modem::Urc;
 const INGRESS_BUF_SIZE: usize = 1024;
 /// Глубина очереди URC.
 const URC_CAPACITY: usize = 8;
-/// Сколько задач могут читать URC.
-const URC_SUBSCRIBERS: usize = 2;
+/// Сколько задач могут читать URC: логирование, детектор перезагрузок и
+/// приём SMS.
+const URC_SUBSCRIBERS: usize = 3;
 /// Буфер сериализации исходящей AT-команды.
 const CMD_BUF_SIZE: usize = 256;
 
@@ -548,18 +549,29 @@ async fn multiplexed_session(
             ingress.read_from(Compat(at_rx)).await;
         };
         let ppp_fut = ppp_runner.run(&mut ppp_channel, ppp_config, |ipv4| apply_ipv4(stack, ipv4));
-        // Ради этого всё и затевалось: опрос модема, пока канал поднят.
+        // Ради этого всё и затевалось: работа с модемом, пока канал поднят.
+        // Опрос CSQ по таймеру и приём SMS по URC — оба невозможны без
+        // мультиплексора, там модем занят PPP.
+        let mut sms_urc: UrcSub = unwrap!(URC_CHANNEL.subscribe().ok());
         let at_fut = async {
+            let mut csq_deadline = Instant::now() + Duration::from_secs(30);
             loop {
-                Timer::after(Duration::from_secs(30)).await;
-                match client.send(&modem::GetSignalQuality).await {
-                    Ok(csq) => {
-                        info!("CMUX: CSQ {} при поднятом PPP", csq.rssi);
-                        // Единственный источник свежего CSQ для MQTT: без
-                        // мультиплексора модем во время PPP недоступен.
-                        mqtt::LAST_CSQ.store(csq.rssi, core::sync::atomic::Ordering::Relaxed);
+                match select(Timer::at(csq_deadline), sms_urc.next_message_pure()).await {
+                    Either::First(()) => {
+                        match client.send(&modem::GetSignalQuality).await {
+                            Ok(csq) => {
+                                info!("CMUX: CSQ {} при поднятом PPP", csq.rssi);
+                                mqtt::LAST_CSQ
+                                    .store(csq.rssi, core::sync::atomic::Ordering::Relaxed);
+                            }
+                            Err(e) => warn!("CMUX: опрос CSQ не удался: {:?}", e),
+                        }
+                        csq_deadline = Instant::now() + Duration::from_secs(30);
                     }
-                    Err(e) => warn!("CMUX: опрос CSQ не удался: {:?}", e),
+                    Either::Second(Urc::NewMessage(notice)) => {
+                        forward_sms(&mut client, notice.index).await;
+                    }
+                    Either::Second(_) => {}
                 }
             }
         };
@@ -571,4 +583,35 @@ async fn multiplexed_session(
     };
 
     select(pump_fut, app_fut).await;
+}
+
+/// Прочитать пришедшее SMS и отдать его в очередь на публикацию.
+///
+/// Удаляем только после успешного чтения: иначе потерянное сообщение исчезнет
+/// безвозвратно. Обратная сторона — при устойчивой ошибке чтения память SIM
+/// заполнится и новые SMS приходить перестанут; это видно по логу.
+async fn forward_sms<A: atat::asynch::AtatClient>(client: &mut A, index: u32) {
+    let sms = match client.send(&modem::ReadSms { index }).await {
+        Ok(sms) => sms,
+        Err(e) => {
+            warn!("SMS: индекс {} не прочитан: {:?}", index, e);
+            return;
+        }
+    };
+
+    // atat живёт на heapless 0.8, остальное дерево — на 0.9; перекладываем
+    // через строковый срез.
+    match mqtt::SmsText::try_from(sms.text.as_str()) {
+        Ok(text) => {
+            info!("SMS: индекс {}, {} байт", index, text.len());
+            if mqtt::SMS_QUEUE.try_send(text).is_err() {
+                warn!("SMS: очередь на публикацию переполнена, сообщение потеряно");
+            }
+        }
+        Err(_) => warn!("SMS: индекс {} не поместился в буфер", index),
+    }
+
+    if let Err(e) = client.send(&modem::DeleteSms { index }).await {
+        warn!("SMS: индекс {} не удалён: {:?}", index, e);
+    }
 }

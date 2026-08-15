@@ -125,6 +125,24 @@ pub async fn prepare<A: AtatClient>(
     //     будет видно, свой это оператор или роуминг.
     log_sim_identity(client).await;
 
+    // 4b. SMS в текстовом режиме, извещение индексом. Ошибки не фатальны:
+    //     без SMS канал всё равно поднимется.
+    if let Err(e) = client.send(&SetSmsTextMode { mode: 1 }).await {
+        warn!("SIM800L: текстовый режим SMS не включён: {:?}", e);
+    }
+    if let Err(e) = client
+        .send(&SetSmsIndication {
+            mode: 2,
+            mt: 1,
+            bm: 0,
+            ds: 0,
+            bfr: 0,
+        })
+        .await
+    {
+        warn!("SIM800L: извещение о SMS не настроено: {:?}", e);
+    }
+
     // 5. Ждём регистрации в GSM и GPRS.
     wait_registration(client, urc).await?;
 
@@ -292,7 +310,7 @@ fn is_reset_urc(urc: &Urc) -> bool {
     match urc {
         Urc::Ready | Urc::PowerDown => true,
         Urc::CallReady | Urc::SmsReady => config::TREAT_READY_URCS_AS_RESET,
-        Urc::PdpDeactivated => false,
+        Urc::PdpDeactivated | Urc::NewMessage(_) => false,
     }
 }
 
