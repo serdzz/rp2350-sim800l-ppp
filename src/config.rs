@@ -63,7 +63,11 @@ pub const RECONNECT_DELAY_SECS: u64 = 10;
 
 /// Брокер. Публичный тестовый: подключается без учётных данных, удобно для
 /// проверки. Для чего-то настоящего поставьте свой.
-pub const MQTT_HOST: &str = "test.mosquitto.org";
+///
+/// Не `test.mosquitto.org`: он регулярно лежит, и на стенде мы получили от
+/// него RST на каждой попытке — причём он был недоступен и с обычного
+/// интернета, то есть дело не в GPRS.
+pub const MQTT_HOST: &str = "broker.hivemq.com";
 pub const MQTT_PORT: u16 = 1883;
 /// Идентификатор клиента — должен быть уникален в пределах брокера.
 pub const MQTT_CLIENT_ID: &str = "rp2350-sim800l";

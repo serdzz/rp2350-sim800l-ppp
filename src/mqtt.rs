@@ -106,7 +106,7 @@ async fn session(
     socket
         .connect((addr, config::MQTT_PORT))
         .await
-        .map_err(|e| warn!("MQTT: TCP не подключился: {:?}", e))?;
+        .map_err(|e| warn!("MQTT: TCP до {} не подключился: {:?}", addr, e))?;
     info!("MQTT: TCP до {} установлен", config::MQTT_HOST);
 
     let mut buffer = BumpBuffer::new(storage);
