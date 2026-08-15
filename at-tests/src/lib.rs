@@ -162,7 +162,14 @@ mod tests {
             }),
             "AT+CNMI=2,1,0,0,0\r"
         );
+        assert_eq!(ser(&GetSmsStorage), "AT+CPMS?\r");
         assert_eq!(ser(&ReadSms { index: 3 }), "AT+CMGR=3\r");
+
+        // Занятость памяти разбирается как есть: три хранилища по три поля.
+        let r = GetSmsStorage
+            .parse(Ok(b"+CPMS: \"SM\",3,30,\"SM\",3,30,\"SM\",3,30"))
+            .unwrap();
+        assert!(r.text.as_str().contains("3,30"));
         assert_eq!(ser(&DeleteSms { index: 3 }), "AT+CMGD=3\r");
 
         // Извещение о новом сообщении: хранилище и индекс.

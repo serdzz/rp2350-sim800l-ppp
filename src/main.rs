@@ -545,6 +545,11 @@ async fn multiplexed_session(
 
         let mut client = Client::new(Compat(at_tx), &RES_SLOT, cmd_buf, atat::Config::new());
 
+        // Настройки SMS задаём именно здесь, на AT-канале: в мультиплексном
+        // режиме каждый DLCI — свой AT-интерфейс, и заданное до AT+CMUX сюда
+        // не переносится.
+        sim800l::configure_sms(&mut client).await;
+
         let ingress_fut = async {
             ingress.read_from(Compat(at_rx)).await;
         };

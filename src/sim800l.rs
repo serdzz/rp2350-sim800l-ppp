@@ -125,24 +125,6 @@ pub async fn prepare<A: AtatClient>(
     //     будет видно, свой это оператор или роуминг.
     log_sim_identity(client).await;
 
-    // 4b. SMS в текстовом режиме, извещение индексом. Ошибки не фатальны:
-    //     без SMS канал всё равно поднимется.
-    if let Err(e) = client.send(&SetSmsTextMode { mode: 1 }).await {
-        warn!("SIM800L: текстовый режим SMS не включён: {:?}", e);
-    }
-    if let Err(e) = client
-        .send(&SetSmsIndication {
-            mode: 2,
-            mt: 1,
-            bm: 0,
-            ds: 0,
-            bfr: 0,
-        })
-        .await
-    {
-        warn!("SIM800L: извещение о SMS не настроено: {:?}", e);
-    }
-
     // 5. Ждём регистрации в GSM и GPRS.
     wait_registration(client, urc).await?;
 
@@ -164,6 +146,42 @@ pub async fn prepare<A: AtatClient>(
     let _ = client.send(&ShutIpStack).await;
 
     Ok(())
+}
+
+/// Включить текстовый режим SMS и извещение о входящих индексом.
+///
+/// Вызывать **на том канале, где потом ждём `+CMTI`**. В мультиплексном
+/// режиме каждый DLCI — отдельный виртуальный AT-интерфейс со своими
+/// настройками, и `AT+CNMI`, заданный до `AT+CMUX`, на канал данных не
+/// распространяется: извещения просто некому слать.
+///
+/// Ошибки не фатальны — без SMS канал всё равно работает.
+pub async fn configure_sms<A: AtatClient>(client: &mut A) {
+    match client.send(&SetSmsTextMode { mode: 1 }).await {
+        Ok(_) => info!("SMS: текстовый режим включён"),
+        Err(e) => warn!("SMS: текстовый режим не включён: {:?}", e),
+    }
+
+    match client
+        .send(&SetSmsIndication {
+            mode: 2,
+            mt: 1,
+            bm: 0,
+            ds: 0,
+            bfr: 0,
+        })
+        .await
+    {
+        Ok(_) => info!("SMS: извещение о входящих настроено"),
+        Err(e) => warn!("SMS: извещение не настроено: {:?}", e),
+    }
+
+    // Заполненная память — вторая частая причина молчания: модем перестаёт
+    // принимать сообщения, и извещать становится не о чем.
+    match client.send(&GetSmsStorage).await {
+        Ok(storage) => info!("SMS: память {}", storage.text.as_str()),
+        Err(e) => warn!("SMS: занятость памяти не прочитана: {:?}", e),
+    }
 }
 
 /// Дозвон в PPP: `ATD*99***1#`.
