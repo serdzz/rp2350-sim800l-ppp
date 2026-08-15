@@ -1,7 +1,12 @@
 //! Телеметрия по MQTT поверх поднятого PPP-канала.
 //!
-//! Зелёный светодиод на GP25 горит, пока клиент подключён к брокеру, и гаснет
-//! при обрыве. Раз в [`config::MQTT_PUBLISH_SECS`] публикуется уровень сигнала.
+//! Раз в [`config::MQTT_PUBLISH_SECS`] публикуется уровень сигнала в
+//! [`config::MQTT_TOPIC_CSQ`]. Зелёный светодиод на GP25 управляется извне:
+//! команда `ON` или `OFF` в [`config::MQTT_TOPIC_LED`].
+//!
+//! Состояние светодиода задаётся только командами и переживает переподключение
+//! к брокеру: гасить его при обрыве значило бы врать о состоянии, которое
+//! никто не менял.
 //!
 //! # Откуда берётся CSQ
 //!
@@ -33,7 +38,10 @@ use embassy_rp::gpio::Output;
 use embassy_time::{Duration, Instant, Timer};
 use rust_mqtt::buffer::BumpBuffer;
 use rust_mqtt::client::Client;
-use rust_mqtt::client::options::{ConnectOptions, PublicationOptions, TopicReference};
+use rust_mqtt::client::event::Event;
+use rust_mqtt::client::options::{
+    ConnectOptions, PublicationOptions, SubscriptionOptions, TopicReference,
+};
 use rust_mqtt::config::{KeepAlive, SessionExpiryInterval};
 use rust_mqtt::types::{MqttString, TopicName};
 
@@ -63,7 +71,6 @@ pub async fn mqtt_task(stack: Stack<'static>, mut led: Output<'static>) -> ! {
     let mut storage = [0u8; MQTT_BUFFER];
 
     loop {
-        led.set_low();
         stack.wait_config_up().await;
 
         if let Err(()) = session(
@@ -75,7 +82,6 @@ pub async fn mqtt_task(stack: Stack<'static>, mut led: Output<'static>) -> ! {
         )
         .await
         {
-            led.set_low();
             Timer::after(RETRY_DELAY).await;
         }
     }
@@ -132,7 +138,20 @@ async fn session(
     unsafe { client.buffer_mut().reset() };
 
     info!("MQTT: подключены к {}", config::MQTT_HOST);
-    led.set_high();
+
+    let led_topic = TopicName::new(
+        MqttString::try_from(config::MQTT_TOPIC_LED)
+            .map_err(|_| warn!("MQTT: слишком длинный топик светодиода"))?,
+    )
+    .ok_or_else(|| warn!("MQTT: недопустимый топик светодиода"))?;
+
+    client
+        .subscribe(led_topic.as_borrowed().into(), SubscriptionOptions::new())
+        .await
+        .map_err(|e| warn!("MQTT: подписка не удалась: {:?}", e))?;
+    info!("MQTT: подписаны на {}", config::MQTT_TOPIC_LED);
+    // SAFETY: заимствований из буфера после подписки нет.
+    unsafe { client.buffer_mut().reset() };
 
     let topic = TopicName::new(
         MqttString::try_from(config::MQTT_TOPIC_CSQ)
@@ -169,8 +188,32 @@ async fn session(
             }
             Either::Second(event) => {
                 let event = event.map_err(|e| warn!("MQTT: соединение потеряно: {:?}", e))?;
-                debug!("MQTT: событие {:?}", event);
+                match event {
+                    Event::Publish(publication) => apply_led_command(led, &publication.message),
+                    other => debug!("MQTT: событие {:?}", other),
+                }
             }
         }
+    }
+}
+
+/// Исполнить команду светодиода: `ON` или `OFF`.
+///
+/// Регистр и обрамляющие пробелы игнорируются — брокеры и клиенты шлют
+/// по-разному, а спорить об этом дешевле один раз здесь.
+fn apply_led_command(led: &mut Output<'static>, payload: &[u8]) {
+    let trimmed = payload.trim_ascii();
+
+    if trimmed.eq_ignore_ascii_case(b"ON") {
+        led.set_high();
+        info!("MQTT: светодиод включён");
+    } else if trimmed.eq_ignore_ascii_case(b"OFF") {
+        led.set_low();
+        info!("MQTT: светодиод выключен");
+    } else {
+        warn!(
+            "MQTT: непонятная команда светодиода ({} байт), ожидается ON или OFF",
+            trimmed.len()
+        );
     }
 }
