@@ -40,6 +40,8 @@ _defmt = [
     "embassy-net-ppp/defmt",
     "atat/defmt",
     "embedded-io/defmt",
+    "rust-mqtt/defmt",
+    "rust-mqtt/log-level-warn",
 ]
 _log = [
     "dep:log",
@@ -49,6 +51,8 @@ _log = [
     "embassy-futures/log",
     "embassy-net/log",
     "embassy-net-ppp/log",
+    "rust-mqtt/log",
+    "rust-mqtt/log-level-warn",
     # NOTE: у atat 0.24 нет feature `log` — в этом режиме его внутренние
     # сообщения молчат. Логи самого приложения не страдают.
 ]
@@ -79,6 +83,10 @@ embassy-net = { version = "0.9", features = [
     "dns",
 ] }
 embassy-net-ppp = "0.3"
+
+# MQTT. default-features = false: в дефолт входит `alloc`, а глобального
+# аллокатора у нас нет — берём `bump`, буфер живёт на стеке задачи.
+rust-mqtt = { version = "0.5", default-features = false, features = ["v5", "bump"] }
 
 # --- AT command layer ---
 # NOTE: atat pulls heapless 0.8; embassy-net pulls heapless 0.9. AT command and

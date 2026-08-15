@@ -34,8 +34,51 @@ pub const SCAN_OPERATORS_ON_FAILURE: bool = true;
 /// питания — да, в отлаженном устройстве можно выключить.
 pub const TREAT_READY_URCS_AS_RESET: bool = true;
 
+// --- CMUX (ветка feat/cmux) ---
+
+/// Поднимать канал через мультиплексор 27.010 вместо передачи UART из рук
+/// в руки.
+///
+/// Включено на ветке feat/cmux для проверки на стенде. Если мультиплексор
+/// не поднимется, вернуть `false` — путь без него проверен и доходит до
+/// HTTP 200.
+pub const USE_CMUX: bool = true;
+
+/// Канал под AT-команды в мультиплексном режиме.
+pub const CMUX_AT_DLCI: u8 = 1;
+/// Канал под PPP.
+pub const CMUX_PPP_DLCI: u8 = 2;
+/// N1 из `AT+CMUX` — максимум байт в поле данных кадра.
+///
+/// 127 держит поле длины однооктетным; PPP при этом просто разложит свои
+/// кадры на несколько UIH.
+pub const CMUX_MAX_PAYLOAD: u16 = 127;
+/// Сколько раз повторить SABM, если модем промолчал.
+pub const CMUX_OPEN_ATTEMPTS: u32 = 5;
+
 /// Пауза перед повторной попыткой после развала PPP-сессии.
 pub const RECONNECT_DELAY_SECS: u64 = 10;
+
+// --- MQTT ---
+
+/// Брокер. Публичный тестовый: подключается без учётных данных, удобно для
+/// проверки. Для чего-то настоящего поставьте свой.
+///
+/// Не `test.mosquitto.org`: он регулярно лежит, и на стенде мы получили от
+/// него RST на каждой попытке — причём он был недоступен и с обычного
+/// интернета, то есть дело не в GPRS.
+pub const MQTT_HOST: &str = "broker.hivemq.com";
+pub const MQTT_PORT: u16 = 1883;
+/// Идентификатор клиента — должен быть уникален в пределах брокера.
+pub const MQTT_CLIENT_ID: &str = "rp2350-sim800l";
+/// Топик для уровня сигнала (публикуем).
+pub const MQTT_TOPIC_CSQ: &str = "rp2350-sim800l/csq";
+/// Топик для принятых SMS (публикуем).
+pub const MQTT_TOPIC_SMS: &str = "rp2350-sim800l/sms";
+/// Топик управления светодиодом (подписываемся). Тело: `ON`, `OFF` или `BLINK`.
+pub const MQTT_TOPIC_LED: &str = "rp2350-sim800l/led";
+/// Как часто публиковать CSQ.
+pub const MQTT_PUBLISH_SECS: u64 = 60;
 
 /// Хост для демо-запроса после подъёма IP.
 pub const DEMO_HOST: &str = "example.com";

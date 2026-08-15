@@ -86,7 +86,7 @@ pub struct InfoText {
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "_defmt", derive(defmt::Format))]
 pub struct RawLine {
-    pub text: String<256>,
+    pub text: String<384>,
 }
 
 impl atat::AtatResp for RawLine {}
@@ -134,6 +134,27 @@ pub struct SetVerboseErrors {
 pub struct SetBaudRate {
     #[at_arg(position = 0)]
     pub rate: u32,
+}
+
+/// `AT+CMUX=<mode>,<subset>,<port_speed>,<N1>` — перевести линию в
+/// мультиплексный режим 3GPP TS 27.010.
+///
+/// После `OK` обычный AT-обмен по этому UART заканчивается: дальше всё, включая
+/// сами AT-команды, ходит кадрами — см. [`crate::cmux`].
+///
+/// `mode` 0 — basic option, `subset` 0 — только UIH, `port_speed` 5 — 115200
+/// бод (кодировка из 3GPP TS 27.007), `n1` — максимальный размер поля данных.
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+CMUX", NoResponse, timeout_ms = 5_000)]
+pub struct SetCmuxMode {
+    #[at_arg(position = 0)]
+    pub mode: u8,
+    #[at_arg(position = 1)]
+    pub subset: u8,
+    #[at_arg(position = 2)]
+    pub port_speed: u8,
+    #[at_arg(position = 3)]
+    pub n1: u16,
 }
 
 /// `AT&W` — сохранить текущие настройки в профиль модуля.
@@ -207,6 +228,77 @@ pub fn imsi_mnc(imsi: &str) -> &str {
     );
     let end = if three_digit_mnc { 6 } else { 5 };
     imsi.get(3..end).unwrap_or("??")
+}
+
+/// `+CMTI: "<storage>",<index>` — пришло новое SMS.
+#[derive(Clone, Debug, AtatResp)]
+#[cfg_attr(feature = "_defmt", derive(defmt::Format))]
+pub struct NewMessageIndex {
+    #[at_arg(position = 0)]
+    pub storage: String<8>,
+    #[at_arg(position = 1)]
+    pub index: u32,
+}
+
+/// `AT+CMGF=<mode>` — 1 = текстовый режим SMS вместо PDU.
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+CMGF", NoResponse, timeout_ms = 5_000)]
+pub struct SetSmsTextMode {
+    #[at_arg(position = 0)]
+    pub mode: u8,
+}
+
+/// `AT+CNMI=<mode>,<mt>,<bm>,<ds>,<bfr>` — как извещать о входящих SMS.
+///
+/// Нас интересует `2,1,0,0,0`: модем сохраняет сообщение и присылает `+CMTI`
+/// с индексом. Вариант `2,2,...`, при котором текст приходит прямо в URC,
+/// не годится: тело идёт второй строкой, а разборщик URC в `atat` читает
+/// только до первого перевода строки и тело потеряет.
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+CNMI", NoResponse, timeout_ms = 5_000)]
+pub struct SetSmsIndication {
+    #[at_arg(position = 0)]
+    pub mode: u8,
+    #[at_arg(position = 1)]
+    pub mt: u8,
+    #[at_arg(position = 2)]
+    pub bm: u8,
+    #[at_arg(position = 3)]
+    pub ds: u8,
+    #[at_arg(position = 4)]
+    pub bfr: u8,
+}
+
+/// `AT+CPMS?` — занятость памяти под SMS.
+///
+/// Ответ вида `+CPMS: "SM",3,30,...`: использовано и всего, по три поля на
+/// каждое из трёх хранилищ. Если память заполнена, модем перестаёт принимать
+/// сообщения и `+CMTI` не приходит вовсе — по одной этой строке видно, в этом
+/// дело или нет.
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+CPMS?", RawLine, parse = parse_raw_line, timeout_ms = 5_000)]
+pub struct GetSmsStorage;
+
+/// `AT+CMGR=<index>` — прочитать сообщение из памяти.
+///
+/// Ответ — две строки: заголовок `+CMGR: "REC UNREAD","<номер>",...` и текст.
+/// Разбираем как есть: формат заголовка у операторов гуляет, а нам нужен
+/// прежде всего текст.
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+CMGR", RawLine, parse = parse_raw_line, timeout_ms = 10_000)]
+pub struct ReadSms {
+    #[at_arg(position = 0)]
+    pub index: u32,
+}
+
+/// `AT+CMGD=<index>` — удалить сообщение.
+///
+/// Без удаления память SIM забьётся, и новые SMS перестанут приходить.
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+CMGD", NoResponse, timeout_ms = 25_000)]
+pub struct DeleteSms {
+    #[at_arg(position = 0)]
+    pub index: u32,
 }
 
 /// `AT+COPS?` — на какой сети мы сейчас.
@@ -323,4 +415,7 @@ pub enum Urc {
     /// Сеть деактивировала PDP-контекст.
     #[at_urc(b"+PDP")]
     PdpDeactivated,
+    /// Пришло SMS: модем сообщает, куда его положил.
+    #[at_urc(b"+CMTI")]
+    NewMessage(NewMessageIndex),
 }

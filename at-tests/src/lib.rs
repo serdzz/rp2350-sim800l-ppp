@@ -14,6 +14,10 @@ pub mod modem;
 #[path = "../../src/lipo.rs"]
 pub mod lipo;
 
+/// Фрейминг CMUX. Тесты живут внутри самого модуля.
+#[path = "../../src/cmux.rs"]
+pub mod cmux;
+
 #[cfg(test)]
 mod tests {
     use super::modem::*;
@@ -41,6 +45,16 @@ mod tests {
         assert_eq!(ser(&ShutIpStack), "AT+CIPSHUT\r");
         // Префикс "AT" + "&W", без знака "=" — полей у команды нет.
         assert_eq!(ser(&SaveSettings), "AT&W\r");
+        // basic option, только UIH, 115200 бод, поле данных до 127 байт.
+        assert_eq!(
+            ser(&SetCmuxMode {
+                mode: 0,
+                subset: 0,
+                port_speed: 5,
+                n1: 127
+            }),
+            "AT+CMUX=0,0,5,127\r"
+        );
         assert_eq!(
             ser(&SetPdpContext {
                 cid: 1,
@@ -134,12 +148,65 @@ mod tests {
         assert_eq!(imsi_mnc("24"), "??");
     }
 
+    /// Команды и URC для приёма SMS.
+    #[test]
+    fn sms_commands_and_notification() {
+        assert_eq!(ser(&SetSmsTextMode { mode: 1 }), "AT+CMGF=1\r");
+        assert_eq!(
+            ser(&SetSmsIndication {
+                mode: 2,
+                mt: 1,
+                bm: 0,
+                ds: 0,
+                bfr: 0
+            }),
+            "AT+CNMI=2,1,0,0,0\r"
+        );
+        assert_eq!(ser(&GetSmsStorage), "AT+CPMS?\r");
+        assert_eq!(ser(&ReadSms { index: 3 }), "AT+CMGR=3\r");
+
+        // Занятость памяти разбирается как есть: три хранилища по три поля.
+        let r = GetSmsStorage
+            .parse(Ok(b"+CPMS: \"SM\",3,30,\"SM\",3,30,\"SM\",3,30"))
+            .unwrap();
+        assert!(r.text.as_str().contains("3,30"));
+        assert_eq!(ser(&DeleteSms { index: 3 }), "AT+CMGD=3\r");
+
+        // Извещение о новом сообщении: хранилище и индекс.
+        let urc = Urc::parse(b"+CMTI: \"SM\",3").unwrap();
+        match urc {
+            Urc::NewMessage(n) => {
+                assert_eq!(n.storage.as_str(), "SM");
+                assert_eq!(n.index, 3);
+            }
+            other => panic!("{:?}", other),
+        }
+
+        // Ответ на AT+CMGR — две строки; берём как есть, включая текст.
+        let body = b"+CMGR: \"REC UNREAD\",\"+37120000000\",\"\",\"26/08/15,12:00:00+12\"\r\nHello";
+        let r = ReadSms { index: 3 }.parse(Ok(body)).unwrap();
+        assert!(r.text.as_str().contains("+37120000000"));
+        assert!(r.text.as_str().ends_with("Hello"));
+    }
+
+    /// `+CMTI` не должен затенять ответы на наши команды.
+    #[test]
+    fn cmti_does_not_shadow_cmgr() {
+        let mut d = atat::DefaultDigester::<Urc>::new().with_custom_success(parse_shut_ok);
+
+        let (res, _) = d.digest(b"\r\n+CMTI: \"SM\",3\r\n");
+        assert!(matches!(res, DigestResult::Urc(_)), "{:?}", res);
+
+        let (res, _) = d.digest(b"\r\n+CMGR: \"REC UNREAD\",\"+371\",\"\",\"x\"\r\nHi\r\n\r\nOK\r\n");
+        assert!(matches!(res, DigestResult::Response(Ok(_))), "{:?}", res);
+    }
+
     /// Длинный список сетей обязан обрезаться, а не паниковать.
     #[test]
     fn raw_line_truncates_instead_of_panicking() {
         let long = vec![b'x'; 4096];
         let r = ScanOperators.parse(Ok(&long)).unwrap();
-        assert_eq!(r.text.len(), 256, "должно обрезаться по вместимости");
+        assert_eq!(r.text.len(), 384, "должно обрезаться по вместимости");
     }
 
     /// Обрезка не должна разрубать многобайтный символ пополам.
@@ -147,9 +214,9 @@ mod tests {
     fn raw_line_truncation_keeps_utf8_intact() {
         let long = "ю".repeat(4096);
         let r = ScanOperators.parse(Ok(long.as_bytes())).unwrap();
-        // 256-байтный буфер, символ по 2 байта -> 128 символов, 256 байт.
-        assert_eq!(r.text.chars().count(), 128);
-        assert_eq!(r.text.len(), 256);
+        // 384-байтный буфер, символ по 2 байта -> 192 символа, 384 байта.
+        assert_eq!(r.text.chars().count(), 192);
+        assert_eq!(r.text.len(), 384);
     }
 
     /// Ровно тот баг, что уронил дозвон на живом стенде: `AT+CIPSHUT`
