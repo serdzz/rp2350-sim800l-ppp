@@ -79,6 +79,24 @@ pub fn parse_block_mask(command: &str) -> Option<u8> {
     Some(mask)
 }
 
+/// Разобрать команду полной блокировки: `block` или `accept`.
+///
+/// Не `on`/`off`, хотя так короче: «ON» одинаково правдоподобно читается и как
+/// «блокировка включена», и как «приём включён». Спутать эти два смысла на
+/// работающем автомате — значит либо глотать монеты без кредита, либо
+/// принимать их там, где принимать не собирались.
+pub fn parse_total_block(command: &str) -> Option<bool> {
+    let command = command.trim();
+
+    if command.eq_ignore_ascii_case("block") {
+        Some(true)
+    } else if command.eq_ignore_ascii_case("accept") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +137,19 @@ mod tests {
         assert!(!is_blocked(mask, 1));
         // Выход за число линий блокировкой не считается.
         assert!(!is_blocked(0xFF, LINES));
+    }
+
+    #[test]
+    fn parses_total_block_commands() {
+        assert_eq!(parse_total_block("block"), Some(true));
+        assert_eq!(parse_total_block("BLOCK"), Some(true));
+        assert_eq!(parse_total_block(" accept "), Some(false));
+        assert_eq!(parse_total_block("ACCEPT"), Some(false));
+
+        // Двусмысленное намеренно не принимается — см. документацию функции.
+        for bad in ["on", "off", "1", "0", "", "all", "none", "blocked"] {
+            assert!(parse_total_block(bad).is_none(), "принято: {bad}");
+        }
     }
 
     #[test]

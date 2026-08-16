@@ -232,6 +232,9 @@ async fn main(spawner: Spawner) {
     for (channel, line) in coin_lines.into_iter().enumerate() {
         spawner.spawn(unwrap!(coin_io::coin_line_task(line, channel)));
     }
+    // Полная блокировка — контакт 6 приёмника. Вывод создаётся внутри задачи:
+    // полярность зависит от буферного каскада, и знать о ней должен один файл.
+    spawner.spawn(unwrap!(coin_io::total_block_task(p.PIN_9)));
 
     // Экран SSD1306 на GP16 (SDA) / GP17 (SCL) — это выводы I2C0.
     spawner.spawn(unwrap!(display::display_task(I2c::new_async(

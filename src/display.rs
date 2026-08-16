@@ -42,6 +42,7 @@ use ssd1306::{I2CDisplayInterface, Ssd1306Async};
 
 use crate::clock;
 use crate::coin;
+use crate::coin_io;
 use crate::mqtt;
 
 /// Адреса, на которых встречаются эти модули. `0x3C` — заводской, `0x3D`
@@ -147,13 +148,19 @@ async fn render(display: &mut Display) {
     let rssi = mqtt::LAST_CSQ.load(core::sync::atomic::Ordering::Relaxed);
     draw_signal(display, clock::signal_bars(rssi));
 
-    // Кредит — главное для автомата, поэтому отдельной строкой и крупно.
-    let mut credit = heapless::String::<20>::new();
+    // Кредит — главное для автомата, поэтому отдельной строкой.
+    //
+    // Рядом с ним признак полной блокировки: закрытый приёмник, никак себя не
+    // выдающий, выглядит как сломанный, и разбираться с этим будут отвёрткой.
+    let mut credit = heapless::String::<24>::new();
     let total = coin::credit();
     let _ = core::fmt::Write::write_fmt(
         &mut credit,
         format_args!("Кредит {}.{:02}", total / 100, total % 100),
     );
+    if coin_io::total_blocked() {
+        let _ = core::fmt::Write::write_str(&mut credit, " ЗАКРЫТО");
+    }
     let _ = Text::new(&credit, Point::new(2, 46), small).draw(display);
 
     // Нижняя строка сжата: уровень в дБм и состояние канала до брокера.

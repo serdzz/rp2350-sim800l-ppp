@@ -149,10 +149,10 @@ async fn session(
 
     let mut buffer = BumpBuffer::new(storage);
     // Первый параметр — сколько SUBSCRIBE может быть в полёте одновременно.
-    // Их два: светодиод и блокировка монетоприёмника. `subscribe()` не ждёт
-    // SUBACK, он только отправляет пакет, поэтому с запасом в единицу вторая
-    // подписка отвалилась бы с `SessionBuffer`.
-    let mut client = Client::<'_, _, _, 2, 1, 1, 1>::new(&mut buffer);
+    // Их три: светодиод, поканальная и полная блокировка монетоприёмника.
+    // `subscribe()` не ждёт SUBACK, он только отправляет пакет, поэтому с
+    // запасом в единицу вторая подписка отвалилась бы с `SessionBuffer`.
+    let mut client = Client::<'_, _, _, 3, 1, 1, 1>::new(&mut buffer);
 
     let client_id = MqttString::try_from(config::MQTT_CLIENT_ID)
         .map_err(|_| warn!("MQTT: слишком длинный client id"))?;
@@ -176,7 +176,11 @@ async fn session(
     info!("MQTT: подключены к {}", config::MQTT_HOST);
     CONNECTED.store(true, Ordering::Relaxed);
 
-    for name in [config::MQTT_TOPIC_LED, config::MQTT_TOPIC_COIN_BLOCK] {
+    for name in [
+        config::MQTT_TOPIC_LED,
+        config::MQTT_TOPIC_COIN_BLOCK,
+        config::MQTT_TOPIC_COIN_TOTAL,
+    ] {
         let filter = topic_name(name)?;
         client
             .subscribe(filter.as_borrowed().into(), SubscriptionOptions::new())
@@ -293,6 +297,7 @@ fn dispatch<const N: usize>(publication: &Publish<'_, N>) {
     match topic {
         config::MQTT_TOPIC_LED => apply_led_command(&publication.message),
         config::MQTT_TOPIC_COIN_BLOCK => coin_io::apply_block_command(&publication.message),
+        config::MQTT_TOPIC_COIN_TOTAL => coin_io::apply_total_command(&publication.message),
         other => warn!("MQTT: публикация в неожиданном топике {}", other),
     }
 }

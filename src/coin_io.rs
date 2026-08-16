@@ -12,8 +12,38 @@
 //! | 10 | output line 4 | GP6 |
 //! | 3 | output line 5 | GP7 |
 //! | 4 | output line 6 | GP8 |
+//! | 6 | total blocking | GP9 через ключ, см. ниже |
 //!
 //! Нумерация линий и контактов **не совпадает** — на этом легко ошибиться.
+//!
+//! # Полная блокировка
+//!
+//! Контакт 6 закрывает приём целиком, независимо от поканальной маски. По
+//! схеме подключения он активен **высоким**: блокировка при `≥ 3.5 В`, приём
+//! при `≤ 1 В`, выдержит до 35 В.
+//!
+//! Порог 3.5 В выше, чем выдаёт RP2350, поэтому напрямую вывод сюда заводить
+//! нельзя — 3.3 В попадают под порог, и блокировка либо не сработает, либо
+//! будет срабатывать через раз. Между ними ставится ключ на NPN, подтягивающий
+//! линию к +12 В:
+//!
+//! ```text
+//!                        +12 В
+//!                          │
+//!                         10к
+//!                          │
+//!   GP9 ──4.7к──┬── base   ├──────── контакт 6 (total blocking)
+//!               │        ╱
+//!              10к   NPN │
+//!               │        ╲
+//!              GND ───────┴──────── GND
+//! ```
+//!
+//! Каскад инвертирует, и это выбрано намеренно: пока контроллер в сбросе и
+//! `GP9` не управляется, резистор в базе держит транзистор закрытым, на линии
+//! 12 В — приёмник **заблокирован**. Монета, брошенная в мёртвый автомат, не
+//! будет проглочена без кредита. Полярность задаётся
+//! [`config::COIN_TOTAL_BLOCK_INVERTED`].
 //!
 //! # Почему выводы двунаправленные
 //!
@@ -43,7 +73,9 @@
 //! засчитываем. Затем дожидаемся возврата линии в высокий уровень — иначе один
 //! импульс был бы посчитан многократно.
 
-use embassy_rp::gpio::{Flex, Pull};
+use embassy_rp::Peri;
+use embassy_rp::gpio::{Flex, Level, Output, Pull};
+use embassy_rp::peripherals::PIN_9;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::watch::Watch;
 use embassy_time::{Duration, Timer};
@@ -69,6 +101,70 @@ static BLOCK_MASK: Watch<CriticalSectionRawMutex, u8, { coin::LINES }> = Watch::
 pub fn set_block_mask(mask: u8) {
     BLOCK_MASK.sender().send(mask);
     info!("COIN: маска блокировки 0b{:06b}", mask);
+}
+
+/// Полностью ли заблокирован приём. Отдельно от [`BLOCK_MASK`], потому что
+/// это независимое состояние: закрытый автомат не отменяет того, какие монеты
+/// в нём не принимаются, когда он открыт.
+static TOTAL_BLOCK: Watch<CriticalSectionRawMutex, bool, 1> = Watch::new();
+
+/// Закрыть или открыть приём целиком.
+pub fn set_total_block(blocked: bool) {
+    TOTAL_BLOCK.sender().send(blocked);
+    info!(
+        "COIN: приём {}",
+        if blocked { "заблокирован" } else { "открыт" }
+    );
+}
+
+/// Заблокирован ли приём целиком. Читает экран.
+pub fn total_blocked() -> bool {
+    TOTAL_BLOCK.try_get().unwrap_or(false)
+}
+
+/// Обработать команду полной блокировки, пришедшую по MQTT.
+pub fn apply_total_command(payload: &[u8]) {
+    let Ok(text) = core::str::from_utf8(payload) else {
+        warn!("COIN: команда полной блокировки не в UTF-8");
+        return;
+    };
+
+    match coin::parse_total_block(text) {
+        Some(blocked) => set_total_block(blocked),
+        None => warn!("COIN: непонятная команда, ожидается block или accept"),
+    }
+}
+
+/// Уровень на `GP9`, соответствующий заданному состоянию.
+///
+/// Полярность задаётся [`config::COIN_TOTAL_BLOCK_INVERTED`] — см. там про
+/// буферный каскад и порог 3.5 В.
+const fn total_level(blocked: bool) -> Level {
+    if blocked != config::COIN_TOTAL_BLOCK_INVERTED {
+        Level::High
+    } else {
+        Level::Low
+    }
+}
+
+/// Держит линию полной блокировки (контакт 6 приёмника).
+///
+/// Вывод создаётся здесь, а не в `main`, чтобы полярность знал ровно один
+/// файл. Стартовый уровень — «заблокировано»: до первой команды автомат
+/// закрыт, а не принимает монеты неизвестно на каком основании.
+#[embassy_executor::task]
+pub async fn total_block_task(pin: Peri<'static, PIN_9>) -> ! {
+    let mut pin = Output::new(pin, total_level(true));
+    let mut rx = unwrap!(TOTAL_BLOCK.receiver());
+
+    // Первое состояние задаём сами: без него приёмник остался бы закрытым до
+    // прихода команды, а работать он должен и без связи.
+    set_total_block(false);
+
+    loop {
+        let blocked = rx.changed().await;
+        pin.set_level(total_level(blocked));
+    }
 }
 
 /// Обработать команду блокировки, пришедшую по MQTT.
