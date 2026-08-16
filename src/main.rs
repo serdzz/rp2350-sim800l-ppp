@@ -24,9 +24,11 @@ mod fmt;
 
 mod app;
 mod battery;
+mod clock;
 mod cmux;
 mod cmux_transport;
 mod config;
+mod display;
 mod io_compat;
 mod led;
 mod lipo;
@@ -47,7 +49,8 @@ use embassy_rp::adc::{
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
 use embassy_rp::gpio::{Input, Level, Output, Pull};
-use embassy_rp::peripherals::UART0;
+use embassy_rp::i2c::{Config as I2cConfig, I2c, InterruptHandler as I2cInterruptHandler};
+use embassy_rp::peripherals::{I2C0, UART0};
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
@@ -111,6 +114,7 @@ const RESET_STREAK_HINT: u32 = 3;
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
     ADC_IRQ_FIFO => AdcInterruptHandler;
+    I2C0_IRQ => I2cInterruptHandler<I2C0>;
 });
 
 /// Фоновая задача сетевого стека `embassy-net`.
@@ -213,6 +217,15 @@ async fn main(spawner: Spawner) {
     spawner.spawn(unwrap!(net_task(net_runner)));
     spawner.spawn(unwrap!(urc_task(unwrap!(URC_CHANNEL.subscribe().ok()))));
     spawner.spawn(unwrap!(app::demo_task(stack)));
+    // Экран SSD1306 на GP16 (SDA) / GP17 (SCL) — это выводы I2C0.
+    spawner.spawn(unwrap!(display::display_task(I2c::new_async(
+        p.I2C0,
+        p.PIN_17,
+        p.PIN_16,
+        Irqs,
+        I2cConfig::default(),
+    ))));
+
     // Зелёный светодиод на GP25 — через R19 470R на землю, активен высоким.
     spawner.spawn(unwrap!(led::led_task(Output::new(p.PIN_25, Level::Low))));
     spawner.spawn(unwrap!(mqtt::mqtt_task(stack)));
@@ -571,6 +584,7 @@ async fn multiplexed_session(
                             }
                             Err(e) => warn!("CMUX: опрос CSQ не удался: {:?}", e),
                         }
+                        read_network_time(&mut client).await;
                         csq_deadline = Instant::now() + Duration::from_secs(30);
                     }
                     Either::Second(Urc::NewMessage(notice)) => {
@@ -618,5 +632,22 @@ async fn forward_sms<A: atat::asynch::AtatClient>(client: &mut A, index: u32) {
 
     if let Err(e) = client.send(&modem::DeleteSms { index }).await {
         warn!("SMS: индекс {} не удалён: {:?}", index, e);
+    }
+}
+
+/// Спросить у модема время сети и запомнить его для дисплея.
+///
+/// Часы модуля идут сами, но синхронизируются сетью только при регистрации,
+/// поэтому перечитываем их вместе с уровнем сигнала. Заводскую дату (модем
+/// отдаёт 2004 год, пока NITZ не пришёл) не сохраняем — иначе на экране
+/// появилось бы правдоподобно выглядящее враньё.
+async fn read_network_time<A: atat::asynch::AtatClient>(client: &mut A) {
+    match client.send(&modem::GetClock).await {
+        Ok(response) => match clock::parse_cclk(response.text.as_str()) {
+            Some(now) if now.is_plausible() => clock::store(now),
+            Some(_) => debug!("CLOCK: сеть время ещё не прислала"),
+            None => warn!("CLOCK: не разобрал {}", response.text.as_str()),
+        },
+        Err(e) => warn!("CLOCK: AT+CCLK? не ответил: {:?}", e),
     }
 }

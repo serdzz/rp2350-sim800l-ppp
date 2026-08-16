@@ -269,6 +269,26 @@ pub struct SetSmsIndication {
     pub bfr: u8,
 }
 
+/// `AT+CLTS=<mode>` — принимать время от сети (NITZ).
+///
+/// Настройка вступает в силу **только после перезапуска модуля**, поэтому
+/// её имеет смысл сохранять в профиль через `AT&W`: реальное время появится
+/// со следующего включения.
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+CLTS", NoResponse, timeout_ms = 5_000)]
+pub struct SetNetworkTime {
+    #[at_arg(position = 0)]
+    pub mode: u8,
+}
+
+/// `AT+CCLK?` — часы модуля.
+///
+/// Ответ `+CCLK: "yy/MM/dd,hh:mm:ss±zz"` разбирается в [`crate::clock`], а не
+/// здесь: разбор чистый и проверяется на хосте.
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+CCLK?", RawLine, parse = parse_raw_line, timeout_ms = 5_000)]
+pub struct GetClock;
+
 /// `AT+CPMS?` — занятость памяти под SMS.
 ///
 /// Ответ вида `+CPMS: "SM",3,30,...`: использовано и всего, по три поля на

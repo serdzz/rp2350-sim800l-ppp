@@ -14,6 +14,10 @@ pub mod modem;
 #[path = "../../src/lipo.rs"]
 pub mod lipo;
 
+/// Разбор времени сети и шкала сигнала — тесты внутри модуля.
+#[path = "../../src/clock.rs"]
+pub mod clock;
+
 /// Фрейминг CMUX. Тесты живут внутри самого модуля.
 #[path = "../../src/cmux.rs"]
 pub mod cmux;

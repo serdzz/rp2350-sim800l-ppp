@@ -41,7 +41,7 @@
 //! брокер разорвёт соединение по keepalive. Поэтому публикация и опрос сидят
 //! в одном `select`.
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use embassy_futures::select::{Either3, select3};
 use embassy_net::Stack;
@@ -73,6 +73,9 @@ pub type SmsText = heapless::String<384>;
 /// чем застопорить разбор AT-канала.
 pub static SMS_QUEUE: Channel<CriticalSectionRawMutex, SmsText, 4> = Channel::new();
 
+/// Держится ли сейчас соединение с брокером. Читает экран.
+pub static CONNECTED: AtomicBool = AtomicBool::new(false);
+
 /// Последний измеренный уровень сигнала. 99 — «не измерено», как в `+CSQ`.
 ///
 /// Пишет владелец AT-канала, читает [`mqtt_task`].
@@ -99,7 +102,9 @@ pub async fn mqtt_task(stack: Stack<'static>) -> ! {
     loop {
         stack.wait_config_up().await;
 
-        if let Err(()) = session(stack, &mut rx_buffer, &mut tx_buffer, &mut storage).await {
+        let outcome = session(stack, &mut rx_buffer, &mut tx_buffer, &mut storage).await;
+        CONNECTED.store(false, Ordering::Relaxed);
+        if let Err(()) = outcome {
             Timer::after(RETRY_DELAY).await;
         }
     }
@@ -155,6 +160,7 @@ async fn session(
     unsafe { client.buffer_mut().reset() };
 
     info!("MQTT: подключены к {}", config::MQTT_HOST);
+    CONNECTED.store(true, Ordering::Relaxed);
 
     let led_topic = TopicName::new(
         MqttString::try_from(config::MQTT_TOPIC_LED)

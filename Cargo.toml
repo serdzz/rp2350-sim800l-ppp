@@ -112,6 +112,8 @@ cortex-m-rt = "0.7"
 embedded-io = "0.7"
 embedded-io-06 = { version = "0.6", package = "embedded-io" }
 embedded-io-async-06 = { version = "0.6", package = "embedded-io-async" }
+ssd1306 = { version = "0.10", default-features = false, features = ["async", "graphics"] }
+embedded-graphics = "0.8"
 
 [profile.release]
 debug = 2
