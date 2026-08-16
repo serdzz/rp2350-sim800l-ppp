@@ -43,7 +43,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use embassy_futures::select::{Either3, select3};
+use embassy_futures::select::{Either4, select4};
 use embassy_net::Stack;
 use embassy_net::dns::DnsQueryType;
 use embassy_net::tcp::TcpSocket;
@@ -52,13 +52,14 @@ use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
 use rust_mqtt::buffer::BumpBuffer;
 use rust_mqtt::client::Client;
-use rust_mqtt::client::event::Event;
+use rust_mqtt::client::event::{Event, Publish};
 use rust_mqtt::client::options::{
     ConnectOptions, PublicationOptions, SubscriptionOptions, TopicReference,
 };
 use rust_mqtt::config::{KeepAlive, SessionExpiryInterval};
 use rust_mqtt::types::{MqttString, TopicName};
 
+use crate::coin_io;
 use crate::config;
 use crate::led;
 
@@ -72,6 +73,15 @@ pub type SmsText = heapless::String<384>;
 /// и роняет сообщение, если очередь переполнена — лучше потерять одно SMS,
 /// чем застопорить разбор AT-канала.
 pub static SMS_QUEUE: Channel<CriticalSectionRawMutex, SmsText, 4> = Channel::new();
+
+/// Событие монетоприёмника, ожидающее публикации.
+pub type CoinText = heapless::String<64>;
+
+/// Очередь событий от монетоприёмника к брокеру.
+///
+/// Отдельная от SMS: монеты идут чаще и терять их обиднее, а смешивать
+/// очереди значило бы, что одно длинное SMS задержит выдачу сдачи.
+pub static COIN_QUEUE: Channel<CriticalSectionRawMutex, CoinText, 8> = Channel::new();
 
 /// Держится ли сейчас соединение с брокером. Читает экран.
 pub static CONNECTED: AtomicBool = AtomicBool::new(false);
@@ -138,7 +148,11 @@ async fn session(
     info!("MQTT: TCP до {} установлен", config::MQTT_HOST);
 
     let mut buffer = BumpBuffer::new(storage);
-    let mut client = Client::<'_, _, _, 1, 1, 1, 1>::new(&mut buffer);
+    // Первый параметр — сколько SUBSCRIBE может быть в полёте одновременно.
+    // Их два: светодиод и блокировка монетоприёмника. `subscribe()` не ждёт
+    // SUBACK, он только отправляет пакет, поэтому с запасом в единицу вторая
+    // подписка отвалилась бы с `SessionBuffer`.
+    let mut client = Client::<'_, _, _, 2, 1, 1, 1>::new(&mut buffer);
 
     let client_id = MqttString::try_from(config::MQTT_CLIENT_ID)
         .map_err(|_| warn!("MQTT: слишком длинный client id"))?;
@@ -162,39 +176,36 @@ async fn session(
     info!("MQTT: подключены к {}", config::MQTT_HOST);
     CONNECTED.store(true, Ordering::Relaxed);
 
-    let led_topic = TopicName::new(
-        MqttString::try_from(config::MQTT_TOPIC_LED)
-            .map_err(|_| warn!("MQTT: слишком длинный топик светодиода"))?,
-    )
-    .ok_or_else(|| warn!("MQTT: недопустимый топик светодиода"))?;
+    for name in [config::MQTT_TOPIC_LED, config::MQTT_TOPIC_COIN_BLOCK] {
+        let filter = topic_name(name)?;
+        client
+            .subscribe(filter.as_borrowed().into(), SubscriptionOptions::new())
+            .await
+            .map_err(|e| warn!("MQTT: подписка на {} не удалась: {:?}", name, e))?;
+        info!("MQTT: подписаны на {}", name);
+        // SAFETY: заимствований из буфера после подписки нет.
+        unsafe { client.buffer_mut().reset() };
+    }
 
-    client
-        .subscribe(led_topic.as_borrowed().into(), SubscriptionOptions::new())
-        .await
-        .map_err(|e| warn!("MQTT: подписка не удалась: {:?}", e))?;
-    info!("MQTT: подписаны на {}", config::MQTT_TOPIC_LED);
-    // SAFETY: заимствований из буфера после подписки нет.
-    unsafe { client.buffer_mut().reset() };
-
-    let topic = TopicName::new(
-        MqttString::try_from(config::MQTT_TOPIC_CSQ)
-            .map_err(|_| warn!("MQTT: слишком длинный топик"))?,
-    )
-    .ok_or_else(|| warn!("MQTT: недопустимый топик"))?;
+    let topic = topic_name(config::MQTT_TOPIC_CSQ)?;
 
     // Дедлайн, а не пересоздаваемый таймер: событие от poll() не должно
     // сдвигать момент следующей публикации.
     let mut deadline = Instant::now();
 
-    let sms_topic = TopicName::new(
-        MqttString::try_from(config::MQTT_TOPIC_SMS)
-            .map_err(|_| warn!("MQTT: слишком длинный топик SMS"))?,
-    )
-    .ok_or_else(|| warn!("MQTT: недопустимый топик SMS"))?;
+    let sms_topic = topic_name(config::MQTT_TOPIC_SMS)?;
+    let coin_topic = topic_name(config::MQTT_TOPIC_COIN)?;
 
     loop {
-        match select3(Timer::at(deadline), client.poll(), SMS_QUEUE.receive()).await {
-            Either3::First(()) => {
+        match select4(
+            Timer::at(deadline),
+            client.poll(),
+            SMS_QUEUE.receive(),
+            COIN_QUEUE.receive(),
+        )
+        .await
+        {
+            Either4::First(()) => {
                 let csq = LAST_CSQ.load(Ordering::Relaxed);
                 let mut payload = heapless::String::<8>::new();
                 let _ = core::fmt::Write::write_fmt(&mut payload, format_args!("{csq}"));
@@ -218,14 +229,14 @@ async fn session(
 
                 deadline = Instant::now() + Duration::from_secs(config::MQTT_PUBLISH_SECS);
             }
-            Either3::Second(event) => {
+            Either4::Second(event) => {
                 let event = event.map_err(|e| warn!("MQTT: соединение потеряно: {:?}", e))?;
                 match event {
-                    Event::Publish(publication) => apply_led_command(&publication.message),
+                    Event::Publish(publication) => dispatch(&publication),
                     other => debug!("MQTT: событие {:?}", other),
                 }
             }
-            Either3::Third(sms) => {
+            Either4::Third(sms) => {
                 client
                     .publish(
                         &PublicationOptions::new(TopicReference::Name(sms_topic.as_borrowed()))
@@ -242,7 +253,47 @@ async fn session(
                 // SAFETY: заимствований из буфера после публикации нет.
                 unsafe { client.buffer_mut().reset() };
             }
+            Either4::Fourth(coin) => {
+                client
+                    .publish(
+                        // Без retain: событие монеты имеет смысл в момент
+                        // наступления, а не как последнее известное состояние.
+                        &PublicationOptions::new(TopicReference::Name(coin_topic.as_borrowed())),
+                        coin.as_bytes().into(),
+                    )
+                    .await
+                    .map_err(|e| warn!("MQTT: событие монеты не опубликовано: {:?}", e))?;
+                info!("MQTT: {} <- {}", config::MQTT_TOPIC_COIN, coin.as_str());
+                // SAFETY: заимствований из буфера после публикации нет.
+                unsafe { client.buffer_mut().reset() };
+            }
         }
+    }
+}
+
+/// Собрать имя топика из строки настроек.
+///
+/// Ошибка возможна только при опечатке в `config` — длиннее 65535 байт или с
+/// подстановочным знаком, — но проверить дешевле, чем ловить это на стенде.
+fn topic_name(name: &str) -> Result<TopicName<'_>, ()> {
+    TopicName::new(
+        MqttString::try_from(name).map_err(|_| warn!("MQTT: слишком длинный топик {}", name))?,
+    )
+    .ok_or_else(|| warn!("MQTT: недопустимый топик {}", name))
+}
+
+/// Разослать входящую публикацию по её топику.
+///
+/// Подписок несколько, а событие приходит одно — различаем по точному имени
+/// топика. Подстановочных знаков в подписках нет, поэтому сравнение строк
+/// здесь и есть полное сопоставление.
+fn dispatch<const N: usize>(publication: &Publish<'_, N>) {
+    let topic: &str = publication.topic.as_ref().as_ref();
+
+    match topic {
+        config::MQTT_TOPIC_LED => apply_led_command(&publication.message),
+        config::MQTT_TOPIC_COIN_BLOCK => coin_io::apply_block_command(&publication.message),
+        other => warn!("MQTT: публикация в неожиданном топике {}", other),
     }
 }
 

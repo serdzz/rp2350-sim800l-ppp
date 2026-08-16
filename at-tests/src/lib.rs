@@ -22,6 +22,10 @@ pub mod clock;
 #[path = "../../src/cmux.rs"]
 pub mod cmux;
 
+/// Учёт монет и разбор команд блокировки — тесты внутри модуля.
+#[path = "../../src/coin.rs"]
+pub mod coin;
+
 #[cfg(test)]
 mod tests {
     use super::modem::*;

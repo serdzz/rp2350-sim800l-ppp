@@ -14,8 +14,8 @@
 //! ┌──────────────────────────────┐
 //! │ 12:34               ▁▃▅▇█    │  время крупно, шкала сигнала справа
 //! │ 2026-08-16                   │
-//! │ GSM -73 dBm                  │
-//! │ MQTT подключён               │
+//! │ Кредит 1.50                  │  накоплено монетоприёмником
+//! │ -73dBm  MQTT +               │
 //! └──────────────────────────────┘
 //! ```
 //!
@@ -41,6 +41,7 @@ use ssd1306::prelude::*;
 use ssd1306::{I2CDisplayInterface, Ssd1306Async};
 
 use crate::clock;
+use crate::coin;
 use crate::mqtt;
 
 /// Адреса, на которых встречаются эти модули. `0x3C` — заводской, `0x3D`
@@ -140,29 +141,35 @@ async fn render(display: &mut Display) {
         }
     }
     let _ = Text::new(&time, Point::new(2, 18), big).draw(display);
-    let _ = Text::new(&date, Point::new(2, 34), small).draw(display);
+    let _ = Text::new(&date, Point::new(2, 32), small).draw(display);
 
-    // Уровень сигнала: шкала и число.
+    // Уровень сигнала: шкала справа вверху.
     let rssi = mqtt::LAST_CSQ.load(core::sync::atomic::Ordering::Relaxed);
     draw_signal(display, clock::signal_bars(rssi));
 
-    let mut level = heapless::String::<16>::new();
-    let dbm = clock::rssi_dbm(rssi);
-    if dbm == 0 {
-        let _ = core::fmt::Write::write_str(&mut level, "GSM нет данных");
-    } else {
-        let _ = core::fmt::Write::write_fmt(&mut level, format_args!("GSM {dbm} dBm"));
-    }
-    let _ = Text::new(&level, Point::new(2, 48), small).draw(display);
+    // Кредит — главное для автомата, поэтому отдельной строкой и крупно.
+    let mut credit = heapless::String::<20>::new();
+    let total = coin::credit();
+    let _ = core::fmt::Write::write_fmt(
+        &mut credit,
+        format_args!("Кредит {}.{:02}", total / 100, total % 100),
+    );
+    let _ = Text::new(&credit, Point::new(2, 46), small).draw(display);
 
-    // Состояние канала до брокера — самый быстрый ответ на вопрос «а связь-то
-    // есть», не заглядывая в лог.
+    // Нижняя строка сжата: уровень в дБм и состояние канала до брокера.
+    let mut status = heapless::String::<24>::new();
+    let dbm = clock::rssi_dbm(rssi);
     let mqtt_state = if mqtt::CONNECTED.load(core::sync::atomic::Ordering::Relaxed) {
-        "MQTT подключён"
+        "MQTT +"
     } else {
-        "MQTT нет связи"
+        "MQTT -"
     };
-    let _ = Text::new(mqtt_state, Point::new(2, 60), small).draw(display);
+    if dbm == 0 {
+        let _ = core::fmt::Write::write_fmt(&mut status, format_args!("--dBm  {mqtt_state}"));
+    } else {
+        let _ = core::fmt::Write::write_fmt(&mut status, format_args!("{dbm}dBm  {mqtt_state}"));
+    }
+    let _ = Text::new(&status, Point::new(2, 60), small).draw(display);
 
     if display.flush().await.is_err() {
         warn!("OLED: не удалось обновить экран");

@@ -27,6 +27,8 @@ mod battery;
 mod clock;
 mod cmux;
 mod cmux_transport;
+mod coin;
+mod coin_io;
 mod config;
 mod display;
 mod io_compat;
@@ -48,7 +50,7 @@ use embassy_rp::adc::{
 };
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
-use embassy_rp::gpio::{Input, Level, Output, Pull};
+use embassy_rp::gpio::{Flex, Input, Level, Output, Pull};
 use embassy_rp::i2c::{Config as I2cConfig, I2c, InterruptHandler as I2cInterruptHandler};
 use embassy_rp::peripherals::{I2C0, UART0};
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
@@ -217,6 +219,20 @@ async fn main(spawner: Spawner) {
     spawner.spawn(unwrap!(net_task(net_runner)));
     spawner.spawn(unwrap!(urc_task(unwrap!(URC_CHANNEL.subscribe().ok()))));
     spawner.spawn(unwrap!(app::demo_task(stack)));
+    // Монетоприёмник: шесть линий на GP3..GP8. Именно `Flex`, а не `Input`:
+    // по этим же линиям канал блокируется удержанием нуля — см. `coin_io`.
+    let coin_lines = [
+        Flex::new(p.PIN_3),
+        Flex::new(p.PIN_4),
+        Flex::new(p.PIN_5),
+        Flex::new(p.PIN_6),
+        Flex::new(p.PIN_7),
+        Flex::new(p.PIN_8),
+    ];
+    for (channel, line) in coin_lines.into_iter().enumerate() {
+        spawner.spawn(unwrap!(coin_io::coin_line_task(line, channel)));
+    }
+
     // Экран SSD1306 на GP16 (SDA) / GP17 (SCL) — это выводы I2C0.
     spawner.spawn(unwrap!(display::display_task(I2c::new_async(
         p.I2C0,
