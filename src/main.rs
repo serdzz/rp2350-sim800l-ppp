@@ -268,6 +268,9 @@ async fn main(spawner: Spawner) {
     spawner.spawn(unwrap!(app::demo_task(stack)));
     // Монетоприёмник: шесть линий на GP3..GP8. Именно `Flex`, а не `Input`:
     // по этим же линиям канал блокируется удержанием нуля — см. `coin_io`.
+    // Маску задаём до запуска задач, чтобы линии без номинала не успели
+    // проглотить монету.
+    coin_io::init();
     let coin_lines = [
         Flex::new(p.PIN_3),
         Flex::new(p.PIN_4),

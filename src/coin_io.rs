@@ -97,6 +97,15 @@ const DEBOUNCE: Duration = Duration::from_millis(20);
 /// [`coin::LINES`].
 static BLOCK_MASK: Watch<CriticalSectionRawMutex, u8, { coin::LINES }> = Watch::new();
 
+/// Выставить исходную маску блокировки. Зовётся до запуска задач линий.
+///
+/// Не полагаемся на «по умолчанию ничего не заблокировано»: линии без номинала
+/// обязаны быть закрыты с первой секунды, иначе монета провалится в кассу, не
+/// дав кредита. См. [`config::COIN_BLOCK_DEFAULT`].
+pub fn init() {
+    set_block_mask(config::COIN_BLOCK_DEFAULT);
+}
+
 /// Задать, какие линии заблокированы. Задачи подхватят изменение немедленно.
 pub fn set_block_mask(mask: u8) {
     BLOCK_MASK.sender().send(mask);
