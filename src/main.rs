@@ -94,9 +94,16 @@ const UART_RX_BUF_SIZE: usize = 2048;
 static RES_SLOT: ResponseSlot<INGRESS_BUF_SIZE> = ResponseSlot::new();
 static URC_CHANNEL: UrcChannel<Urc, URC_CAPACITY, URC_SUBSCRIBERS> = UrcChannel::new();
 
-/// Подписка на URC, которую держит логика инициализации модема.
+/// Подписка на URC для тех, кто читает их адресно, а не ради лога.
 ///
-/// Вторая после `urc_task`; ровно поэтому [`URC_SUBSCRIBERS`] равен двум.
+/// Таких две — подъём модема и приём SMS, — но живут они по очереди, в разных
+/// фазах. Вместе с постоянной подпиской `urc_task` отсюда и берётся
+/// [`URC_SUBSCRIBERS`].
+///
+/// **Подписку нельзя держать дольше, чем её читают**: сообщение лежит в
+/// очереди, пока его не забрали все подписчики, поэтому молчащий подписчик
+/// через [`URC_CAPACITY`] сообщений запирает публикацию, а с ней и весь разбор
+/// AT-канала. См. [`bring_up_subscription`].
 pub type UrcSub = UrcSubscription<'static, Urc, URC_CAPACITY, URC_SUBSCRIBERS>;
 
 /// Разборщик ответов модема со всеми размерами буферов, зафиксированными выше.
@@ -268,10 +275,6 @@ async fn main(spawner: Spawner) {
         password: config::PPP_PASSWORD,
     };
 
-    // Отдельная подписка для bring_up: по `RDY` он поймёт, что модуль ушёл
-    // в перезагрузку, и не будет две минуты опрашивать мёртвую железку.
-    let mut bring_up_urc: UrcSub = unwrap!(URC_CHANNEL.subscribe().ok());
-
     // Модуль включаем один раз; дальше при обрывах переподнимаем только сессию.
     sim800l::power_on(&mut pwrkey).await;
 
@@ -282,7 +285,6 @@ async fn main(spawner: Spawner) {
             stack,
             ingress,
             cmd_buf,
-            &mut bring_up_urc,
             ppp_config,
         )
         .await
@@ -293,11 +295,24 @@ async fn main(spawner: Spawner) {
             stack,
             ingress,
             cmd_buf,
-            &mut bring_up_urc,
             ppp_config,
         )
         .await
     }
+}
+
+/// Подписка на URC для фазы подъёма модема.
+///
+/// Живёт **только** на время подъёма и умирает перед тем, как канал заработает.
+/// Так и задумано: очередь URC хранит сообщение, пока его не забрали все
+/// подписчики, поэтому подписка, которую никто не читает, через
+/// [`URC_CAPACITY`] сообщений намертво запирает публикацию. А публикует
+/// `atat::Ingress`, и заперев её, мы останавливаем разбор всего AT-канала.
+///
+/// Ровно поэтому подписку нельзя завести один раз на всю программу — на
+/// поднятом канале её никто не опрашивает.
+fn bring_up_subscription() -> UrcSub {
+    unwrap!(URC_CHANNEL.subscribe().ok())
 }
 
 /// Применить IPv4-конфигурацию, полученную по IPCP.
@@ -333,7 +348,6 @@ async fn run_plain(
     stack: embassy_net::Stack<'static>,
     mut ingress: ModemIngress,
     cmd_buf: &'static mut [u8; CMD_BUF_SIZE],
-    bring_up_urc: &mut UrcSub,
     ppp_config: embassy_net_ppp::Config<'static>,
 ) -> ! {
     // Сколько раз подряд модуль перезагрузился посреди инициализации.
@@ -344,6 +358,8 @@ async fn run_plain(
         ingress.clear();
 
         let bring_up = {
+            // Подписка живёт ровно этот блок — см. `bring_up_subscription`.
+            let mut bring_up_urc = bring_up_subscription();
             let (uart_tx, uart_rx) = uart.split_ref();
             // Compat(..) переносит UART из embedded-io-async 0.7 в 0.6 — см. io_compat.
             let mut client = Client::new(
@@ -357,7 +373,7 @@ async fn run_plain(
             let ingress_fut = async {
                 ingress.read_from(Compat(uart_rx)).await;
             };
-            let setup_fut = sim800l::bring_up(&mut client, config::APN, bring_up_urc);
+            let setup_fut = sim800l::bring_up(&mut client, config::APN, &mut bring_up_urc);
 
             match select(ingress_fut, setup_fut).await {
                 Either::First(()) => unreachable!(),
@@ -428,7 +444,6 @@ async fn run_multiplexed(
     stack: embassy_net::Stack<'static>,
     mut ingress: ModemIngress,
     cmd_buf: &'static mut [u8; CMD_BUF_SIZE],
-    bring_up_urc: &mut UrcSub,
     ppp_config: embassy_net_ppp::Config<'static>,
 ) -> ! {
     let mut reset_streak = 0u32;
@@ -438,6 +453,10 @@ async fn run_multiplexed(
         ingress.clear();
 
         let prepared = {
+            // Подписка живёт ровно этот блок — см. `bring_up_subscription`.
+            // В фазе B её никто не читает, и переживи она блок, очередь URC
+            // заперлась бы, а с ней встал бы весь разбор AT-канала.
+            let mut bring_up_urc = bring_up_subscription();
             let (uart_tx, uart_rx) = uart.split_ref();
             let mut client = Client::new(
                 Compat(uart_tx),
@@ -449,7 +468,7 @@ async fn run_multiplexed(
                 ingress.read_from(Compat(uart_rx)).await;
             };
             let setup_fut = async {
-                sim800l::prepare(&mut client, config::APN, bring_up_urc).await?;
+                sim800l::prepare(&mut client, config::APN, &mut bring_up_urc).await?;
                 sim800l::enter_cmux(&mut client, config::CMUX_MAX_PAYLOAD).await
             };
 
