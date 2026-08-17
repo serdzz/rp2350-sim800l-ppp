@@ -87,7 +87,7 @@ use embassy_rp::gpio::{Flex, Level, Output, Pull};
 use embassy_rp::peripherals::PIN_9;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::watch::Watch;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 
 use crate::coin;
 use crate::config;
@@ -226,8 +226,18 @@ const POLL: Duration = Duration::from_millis(5);
 ///
 /// Биты кода зажигаются не идеально одновременно, и снять код сразу — значит
 /// прочитать половину: евро (`0b101`) легко превратится в лат (`0b001`).
-/// 25 мс заведомо больше разбега фронтов и заведомо меньше импульса в 100 мс.
-const SETTLE: Duration = Duration::from_millis(25);
+///
+/// 60 мс — не расчёт, а число из рабочего автомата на MSP430
+/// (`COIN_ACCEPTOR_PULSE_MIDLE`), отработавшее в поле. Заведомо больше разбега
+/// фронтов и заведомо меньше импульса в 100 мс.
+const SETTLE: Duration = Duration::from_millis(60);
+
+/// Сколько импульс имеет право длиться, прежде чем считать линию залипшей.
+///
+/// Оттуда же (`COIN_ACCEPTOR_PULSE_MAX`). Без этого предела цикл ожидания
+/// отпускания линий висел бы вечно: оборванный провод или заклинивший выход
+/// молча прекратили бы приём монет навсегда, и в логе не было бы ни строчки.
+const PULSE_MAX: Duration = Duration::from_millis(250);
 
 /// Снять код со всех линий разом.
 ///
@@ -304,8 +314,26 @@ pub async fn coin_task(mut pins: [Flex<'static>; coin::LINES]) -> ! {
         }
 
         // Пока линии не отпущены, новой монеты быть не может.
+        //
+        // Из этого ожидания намеренно нет выхода по таймауту: пока линия
+        // залипла, отличить новую монету от той же самой невозможно, и выход
+        // означал бы начисление кредита за каждый проход цикла. Лучше стоять
+        // и кричать в лог, чем печатать деньги. Отпустят — продолжим сами.
+        let started = Instant::now();
+        let mut reported = false;
         while sample(&pins, blocked) != 0 {
+            if !reported && started.elapsed() > PULSE_MAX {
+                error!(
+                    "COIN: линии не отпущены за {} мс (код 0b{:06b}) — обрыв или заклинивший выход, приём монет стоит",
+                    PULSE_MAX.as_millis(),
+                    sample(&pins, blocked)
+                );
+                reported = true;
+            }
             Timer::after(POLL).await;
+        }
+        if reported {
+            info!("COIN: линии отпущены, приём монет восстановлен");
         }
     }
 }
