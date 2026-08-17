@@ -130,12 +130,13 @@ const WARM_BOOT_SLOT: usize = 0;
 /// Произвольное значение; важно лишь, чтобы случайный мусор его не повторил.
 const WARM_BOOT_MAGIC: u32 = 0x5350_5057;
 
-/// После скольких неудачных подъёмов подряд дёрнуть PWRKEY.
+/// После скольких подъёмов подряд **без единого ответа** дёрнуть PWRKEY.
 ///
 /// Подстраховка к пропуску импульса на тёплом старте: если модуль всё-таки
 /// оказался выключен, через несколько неудач мы его включим. Три попытки —
-/// это около полуминуты, быстрее смысла нет: подъём падает и по причинам,
-/// которые перезапуск модуля не лечит.
+/// это около полуминуты, быстрее смысла нет.
+///
+/// Считается только молчание — см. [`revive_modem_if_stuck`].
 const PWRKEY_AFTER_FAILURES: u32 = 3;
 
 bind_interrupts!(struct Irqs {
@@ -375,16 +376,34 @@ fn bring_up_subscription() -> UrcSub {
 /// Счётчик сбрасывается, чтобы дёргать не чаще, чем раз в
 /// [`PWRKEY_AFTER_FAILURES`] попыток: включение модуля занимает секунды, и
 /// повторять его на каждой итерации значило бы не давать ему стартовать.
-async fn revive_modem_if_stuck(pwrkey: &mut Output<'static>, failure_streak: &mut u32) {
-    if *failure_streak < PWRKEY_AFTER_FAILURES {
+///
+/// # Считается только молчание
+///
+/// Годится ровно одна ошибка — [`NoResponse`](sim800l::BringUpError::NoResponse).
+/// Все остальные означают, что модуль **отвечает**, и импульс его выключит.
+/// Особенно `ModemReset`: он приходит при провале питания, когда модуль
+/// перезагружается сам. Считать его поводом дёрнуть PWRKEY — значит гасить
+/// живой модем посреди и без того тяжёлого цикла.
+async fn revive_modem_if_stuck(
+    pwrkey: &mut Output<'static>,
+    silent_streak: &mut u32,
+    error: &sim800l::BringUpError,
+) {
+    if !matches!(error, sim800l::BringUpError::NoResponse) {
+        *silent_streak = 0;
+        return;
+    }
+
+    *silent_streak += 1;
+    if *silent_streak < PWRKEY_AFTER_FAILURES {
         return;
     }
 
     warn!(
-        "SIM800L: {} неудач подряд, пробую импульс PWRKEY",
-        failure_streak
+        "SIM800L: молчит {} попыток подряд, пробую импульс PWRKEY",
+        silent_streak
     );
-    *failure_streak = 0;
+    *silent_streak = 0;
     sim800l::power_on(pwrkey).await;
 }
 
@@ -426,7 +445,8 @@ async fn run_plain(
 ) -> ! {
     // Сколько раз подряд модуль перезагрузился посреди инициализации.
     let mut reset_streak = 0u32;
-    let mut failure_streak = 0u32;
+    // Сколько раз подряд модуль вообще не отозвался на `AT`.
+    let mut silent_streak = 0u32;
 
     loop {
         // ---------- фаза 1: командный режим (atat владеет UART) ----------
@@ -458,8 +478,7 @@ async fn run_plain(
 
         if let Err(e) = bring_up {
             report_bring_up_error(&e, &mut reset_streak);
-            failure_streak += 1;
-            revive_modem_if_stuck(pwrkey, &mut failure_streak).await;
+            revive_modem_if_stuck(pwrkey, &mut silent_streak, &e).await;
             // Вернуть модем в вменяемое состояние и попробовать снова.
             sim800l::escape_data_mode(&mut uart).await;
             Timer::after(Duration::from_secs(config::RECONNECT_DELAY_SECS)).await;
@@ -467,7 +486,7 @@ async fn run_plain(
         }
 
         reset_streak = 0;
-        failure_streak = 0;
+        silent_streak = 0;
 
         // ---------- фаза 2: data-режим (PPP владеет UART) ----------
         let result = ppp_runner
@@ -526,7 +545,8 @@ async fn run_multiplexed(
     ppp_config: embassy_net_ppp::Config<'static>,
 ) -> ! {
     let mut reset_streak = 0u32;
-    let mut failure_streak = 0u32;
+    // Сколько раз подряд модуль вообще не отозвался на `AT`.
+    let mut silent_streak = 0u32;
 
     loop {
         // ---------- фаза A: обычный AT, до входа в мультиплексор ----------
@@ -560,14 +580,13 @@ async fn run_multiplexed(
 
         if let Err(e) = prepared {
             report_bring_up_error(&e, &mut reset_streak);
-            failure_streak += 1;
-            revive_modem_if_stuck(pwrkey, &mut failure_streak).await;
+            revive_modem_if_stuck(pwrkey, &mut silent_streak, &e).await;
             sim800l::escape_data_mode(&mut uart).await;
             Timer::after(Duration::from_secs(config::RECONNECT_DELAY_SECS)).await;
             continue;
         }
         reset_streak = 0;
-        failure_streak = 0;
+        silent_streak = 0;
 
         // ---------- фаза B: мультиплексный режим ----------
         ingress.clear();
