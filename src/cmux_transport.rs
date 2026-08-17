@@ -470,6 +470,7 @@ where
                 continue;
             }
             Ok(n) => {
+                crate::watchdog::modem_alive();
                 if error_burst > 0 {
                     warn!(
                         "CMUX: линия восстановилась, ошибок чтения подряд: {}",

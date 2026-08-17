@@ -67,7 +67,10 @@ where
 {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         match self.0.read(buf).await {
-            Ok(n) => Ok(n),
+            Ok(n) => {
+                crate::watchdog::modem_alive();
+                Ok(n)
+            }
             Err(e) => {
                 // Пауза здесь, а не у вызывающего, потому что вызывающий —
                 // `atat::Ingress::read_from`, и его цикл при ошибке лишь пишет

@@ -39,6 +39,7 @@ mod mqtt;
 mod sim800l;
 #[cfg(feature = "log-usb")]
 mod usb_logger;
+mod watchdog;
 
 use atat::asynch::{AtatClient, Client};
 use atat::{AtatIngress, DefaultDigester, Ingress, ResponseSlot, UrcChannel, UrcSubscription};
@@ -54,6 +55,7 @@ use embassy_rp::gpio::{Flex, Input, Level, Output, Pull};
 use embassy_rp::i2c::{Config as I2cConfig, I2c, InterruptHandler as I2cInterruptHandler};
 use embassy_rp::peripherals::{I2C0, UART0};
 use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
+use embassy_rp::watchdog::{ResetReason as WatchdogReset, Watchdog as HwWatchdog};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_sync::pipe::{DynamicReader, DynamicWriter, Pipe};
@@ -120,6 +122,22 @@ const CMUX_PPP_PIPE: usize = 2048;
 /// Сколько перезагрузок модуля подряд считать признаком проблем с питанием.
 const RESET_STREAK_HINT: u32 = 3;
 
+/// Скретч-регистр сторожевого таймера под признак тёплого перезапуска.
+///
+/// Переживает перезагрузку чипа и обнуляется при потере питания — именно то
+/// различие, которое нужно, чтобы решить, трогать ли PWRKEY.
+const WARM_BOOT_SLOT: usize = 0;
+/// Произвольное значение; важно лишь, чтобы случайный мусор его не повторил.
+const WARM_BOOT_MAGIC: u32 = 0x5350_5057;
+
+/// После скольких неудачных подъёмов подряд дёрнуть PWRKEY.
+///
+/// Подстраховка к пропуску импульса на тёплом старте: если модуль всё-таки
+/// оказался выключен, через несколько неудач мы его включим. Три попытки —
+/// это около полуминуты, быстрее смысла нет: подъём падает и по причинам,
+/// которые перезапуск модуля не лечит.
+const PWRKEY_AFTER_FAILURES: u32 = 3;
+
 bind_interrupts!(struct Irqs {
     UART0_IRQ => BufferedInterruptHandler<UART0>;
     ADC_IRQ_FIFO => AdcInterruptHandler;
@@ -176,6 +194,27 @@ async fn main(spawner: Spawner) {
     spawner.spawn(unwrap!(usb_logger::logger_task(usb_logger::driver(p.USB))));
 
     info!("RP2350-Plus + SIM800L: старт");
+
+    // --- Сторожевой таймер -------------------------------------------------
+    // Заводим до всего остального: дальше идут ожидания на секунды, и к ним
+    // задача кормления должна быть уже запущена.
+    let mut hw_watchdog = HwWatchdog::new(p.WATCHDOG);
+    // Печатаем строкой, а не через `{:?}`: `ResetReason` реализует `Debug`, но
+    // не `defmt::Format`, и сборка с RTT на нём не собралась бы.
+    if let Some(reason) = hw_watchdog.reset_reason() {
+        warn!(
+            "WDT: прошлый запуск оборвала перезагрузка ({})",
+            match reason {
+                WatchdogReset::TimedOut => "не покормили",
+                WatchdogReset::Forced => "принудительная",
+            }
+        );
+    }
+    // Скретч переживает перезагрузку, но не потерю питания — ровно то, что
+    // нужно, чтобы отличить тёплый перезапуск от холодного старта.
+    let warm_boot = hw_watchdog.get_scratch(WARM_BOOT_SLOT) == WARM_BOOT_MAGIC;
+    hw_watchdog.set_scratch(WARM_BOOT_SLOT, WARM_BOOT_MAGIC);
+    spawner.spawn(unwrap!(watchdog::watchdog_task(hw_watchdog)));
 
     // GP2 -> PWRKEY модуля. Если PWRKEY не разведён (модуль стартует сам),
     // пин просто останется неиспользуемым выходом.
@@ -275,8 +314,17 @@ async fn main(spawner: Spawner) {
         password: config::PPP_PASSWORD,
     };
 
-    // Модуль включаем один раз; дальше при обрывах переподнимаем только сессию.
-    sim800l::power_on(&mut pwrkey).await;
+    // Импульс PWRKEY **переключает** питание модуля, а не включает его. После
+    // перезагрузки по сторожевому таймеру модуль остался работать, и импульс
+    // его бы выключил — поэтому на тёплом старте пропускаем.
+    //
+    // Ошибиться здесь не страшно: если модуль всё-таки окажется выключен, его
+    // включит фаза подъёма, не добившись ответа, — см. `PWRKEY_AFTER_FAILURES`.
+    if warm_boot {
+        info!("SIM800L: тёплый перезапуск, PWRKEY не трогаем");
+    } else {
+        sim800l::power_on(&mut pwrkey).await;
+    }
 
     if config::USE_CMUX {
         run_multiplexed(
@@ -285,6 +333,7 @@ async fn main(spawner: Spawner) {
             stack,
             ingress,
             cmd_buf,
+            &mut pwrkey,
             ppp_config,
         )
         .await
@@ -295,6 +344,7 @@ async fn main(spawner: Spawner) {
             stack,
             ingress,
             cmd_buf,
+            &mut pwrkey,
             ppp_config,
         )
         .await
@@ -313,6 +363,29 @@ async fn main(spawner: Spawner) {
 /// поднятом канале её никто не опрашивает.
 fn bring_up_subscription() -> UrcSub {
     unwrap!(URC_CHANNEL.subscribe().ok())
+}
+
+/// Дёрнуть PWRKEY, если подъём не удаётся подряд слишком много раз.
+///
+/// Нужно из-за того, что импульс PWRKEY **переключает** питание модуля. После
+/// перезагрузки по сторожевому таймеру мы его не трогаем — модуль работает, и
+/// импульс бы его выключил. Но если предположение неверно и модуль всё-таки
+/// мёртв, ждать вечно нельзя: несколько неудач подряд — достаточный повод.
+///
+/// Счётчик сбрасывается, чтобы дёргать не чаще, чем раз в
+/// [`PWRKEY_AFTER_FAILURES`] попыток: включение модуля занимает секунды, и
+/// повторять его на каждой итерации значило бы не давать ему стартовать.
+async fn revive_modem_if_stuck(pwrkey: &mut Output<'static>, failure_streak: &mut u32) {
+    if *failure_streak < PWRKEY_AFTER_FAILURES {
+        return;
+    }
+
+    warn!(
+        "SIM800L: {} неудач подряд, пробую импульс PWRKEY",
+        failure_streak
+    );
+    *failure_streak = 0;
+    sim800l::power_on(pwrkey).await;
 }
 
 /// Применить IPv4-конфигурацию, полученную по IPCP.
@@ -348,10 +421,12 @@ async fn run_plain(
     stack: embassy_net::Stack<'static>,
     mut ingress: ModemIngress,
     cmd_buf: &'static mut [u8; CMD_BUF_SIZE],
+    pwrkey: &mut Output<'static>,
     ppp_config: embassy_net_ppp::Config<'static>,
 ) -> ! {
     // Сколько раз подряд модуль перезагрузился посреди инициализации.
     let mut reset_streak = 0u32;
+    let mut failure_streak = 0u32;
 
     loop {
         // ---------- фаза 1: командный режим (atat владеет UART) ----------
@@ -383,6 +458,8 @@ async fn run_plain(
 
         if let Err(e) = bring_up {
             report_bring_up_error(&e, &mut reset_streak);
+            failure_streak += 1;
+            revive_modem_if_stuck(pwrkey, &mut failure_streak).await;
             // Вернуть модем в вменяемое состояние и попробовать снова.
             sim800l::escape_data_mode(&mut uart).await;
             Timer::after(Duration::from_secs(config::RECONNECT_DELAY_SECS)).await;
@@ -390,6 +467,7 @@ async fn run_plain(
         }
 
         reset_streak = 0;
+        failure_streak = 0;
 
         // ---------- фаза 2: data-режим (PPP владеет UART) ----------
         let result = ppp_runner
@@ -444,9 +522,11 @@ async fn run_multiplexed(
     stack: embassy_net::Stack<'static>,
     mut ingress: ModemIngress,
     cmd_buf: &'static mut [u8; CMD_BUF_SIZE],
+    pwrkey: &mut Output<'static>,
     ppp_config: embassy_net_ppp::Config<'static>,
 ) -> ! {
     let mut reset_streak = 0u32;
+    let mut failure_streak = 0u32;
 
     loop {
         // ---------- фаза A: обычный AT, до входа в мультиплексор ----------
@@ -480,11 +560,14 @@ async fn run_multiplexed(
 
         if let Err(e) = prepared {
             report_bring_up_error(&e, &mut reset_streak);
+            failure_streak += 1;
+            revive_modem_if_stuck(pwrkey, &mut failure_streak).await;
             sim800l::escape_data_mode(&mut uart).await;
             Timer::after(Duration::from_secs(config::RECONNECT_DELAY_SECS)).await;
             continue;
         }
         reset_streak = 0;
+        failure_streak = 0;
 
         // ---------- фаза B: мультиплексный режим ----------
         ingress.clear();
