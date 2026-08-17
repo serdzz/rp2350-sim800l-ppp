@@ -11,6 +11,7 @@
 
 #![allow(async_fn_in_trait)]
 
+use embassy_time::{Duration, Timer};
 use embedded_io::{Error as _, ErrorKind as Kind07};
 use embedded_io_06::{Error as Error06, ErrorKind as Kind06, ErrorType as ErrorType06};
 use embedded_io_async::{Read as Read07, Write as Write07};
@@ -18,6 +19,10 @@ use embedded_io_async_06::{Read as Read06, Write as Write06};
 
 /// Обёртка над транспортом `embedded-io-async` 0.7.
 pub struct Compat<T>(pub T);
+
+/// Пауза после неудачного чтения — защита от холостого цикла в `atat`.
+/// Подробности в [`Read06::read`] ниже.
+const READ_ERROR_BACKOFF: Duration = Duration::from_millis(5);
 
 /// Ошибка, приведённая к системе типов `embedded-io` 0.6.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +66,20 @@ where
     T: Read07,
 {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        self.0.read(buf).await.map_err(|e| CompatError(e.kind()))
+        match self.0.read(buf).await {
+            Ok(n) => Ok(n),
+            Err(e) => {
+                // Пауза здесь, а не у вызывающего, потому что вызывающий —
+                // `atat::Ingress::read_from`, и его цикл при ошибке лишь пишет
+                // в лог и читает снова. Ошибка приёма возвращается сразу, без
+                // ожидания, так что при залипшей линии (модем обесточился и
+                // держит её в нуле) этот цикл съедал бы процессор целиком и
+                // заморозил всю прошивку. Исправить его у себя мы не можем —
+                // зато весь ввод-вывод atat идёт через эту обёртку.
+                Timer::after(READ_ERROR_BACKOFF).await;
+                Err(CompatError(e.kind()))
+            }
+        }
     }
 }
 
