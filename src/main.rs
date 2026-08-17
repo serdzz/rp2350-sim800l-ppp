@@ -279,9 +279,7 @@ async fn main(spawner: Spawner) {
         Flex::new(p.PIN_7),
         Flex::new(p.PIN_8),
     ];
-    for (channel, line) in coin_lines.into_iter().enumerate() {
-        spawner.spawn(unwrap!(coin_io::coin_line_task(line, channel)));
-    }
+    spawner.spawn(unwrap!(coin_io::coin_task(coin_lines)));
     // Полная блокировка — контакт 6 приёмника. Вывод создаётся внутри задачи:
     // полярность зависит от буферного каскада, и знать о ней должен один файл.
     spawner.spawn(unwrap!(coin_io::total_block_task(p.PIN_9)));

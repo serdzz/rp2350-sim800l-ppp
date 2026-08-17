@@ -1,4 +1,4 @@
-//! Монетоприёмник NRI G-13.6000: чтение линий и блокировка каналов.
+//! Монетоприёмник NRI G-13: чтение кода монеты и блокировка.
 //!
 //! # Подключение
 //!
@@ -66,12 +66,21 @@
 //! притягивает линию к земле и никогда не выдаёт 12 В, поэтому на ногу
 //! контроллера попадает максимум 3.3 В.
 //!
-//! # Как считается монета
+//! # Монета опознаётся кодом, а не линией
 //!
-//! Опознанная монета даёт импульс **100 мс**. Ждём спад, выдерживаем
-//! [`DEBOUNCE`], проверяем, что уровень всё ещё низкий, и только тогда
-//! засчитываем. Затем дожидаемся возврата линии в высокий уровень — иначе один
-//! импульс был бы посчитан многократно.
+//! Опознанная монета даёт импульс **100 мс** — но не обязательно на одной
+//! линии. Приёмник умеет передавать номер монеты **двоичным кодом сразу по
+//! нескольким линиям**, и на нашем экземпляре так и сделано: шесть типов монет
+//! уложены в три пина, где, например, `0b000101` — это одно евро.
+//!
+//! Отсюда устройство задачи: снимаем состояние всех шести линий разом,
+//! выдерживаем [`SETTLE`] на разбег фронтов, снимаем ещё раз — и ищем
+//! получившийся код в [`config::COINS`]. Считать линии по отдельности нельзя:
+//! одно евро зажигает два пина, и шесть независимых счётчиков насчитали бы две
+//! монеты вместо одной.
+//!
+//! Затем дожидаемся, пока все линии отпустят, — иначе один импульс был бы
+//! посчитан многократно.
 
 use embassy_rp::Peri;
 use embassy_rp::gpio::{Flex, Level, Output, Pull};
@@ -83,12 +92,6 @@ use embassy_time::{Duration, Timer};
 use crate::coin;
 use crate::config;
 use crate::mqtt;
-
-/// Сколько ждать после спада, прежде чем засчитать монету.
-///
-/// Импульс длится 100 мс, так что 20 мс отсекают помеху и не рискуют
-/// пропустить настоящий сигнал.
-const DEBOUNCE: Duration = Duration::from_millis(20);
 
 /// Текущая маска заблокированных линий.
 ///
@@ -190,24 +193,19 @@ pub fn apply_block_command(payload: &[u8]) {
 }
 
 /// Засчитать монету и отправить событие в MQTT.
-fn register(line: usize) {
-    let value = config::COIN_VALUES.get(line).copied().unwrap_or(0);
-    if value == 0 {
-        warn!("COIN: линия {} без номинала, монета не засчитана", line + 1);
-        return;
-    }
-
-    let total = coin::add(value);
-    info!("COIN: линия {}, номинал {}, кредит {}", line + 1, value, total);
+fn register(coin_found: &coin::Coin) {
+    let total = coin::add(coin_found.value);
+    info!(
+        "COIN: {} (код 0b{:06b}), номинал {}, кредит {}",
+        coin_found.name, coin_found.mask, coin_found.value, total
+    );
 
     let mut payload = mqtt::CoinText::new();
     let _ = core::fmt::Write::write_fmt(
         &mut payload,
         format_args!(
-            "{{\"line\":{},\"value\":{},\"credit\":{}}}",
-            line + 1,
-            value,
-            total
+            "{{\"coin\":\"{}\",\"code\":{},\"value\":{},\"credit\":{}}}",
+            coin_found.name, coin_found.mask, coin_found.value, total
         ),
     );
 
@@ -218,44 +216,96 @@ fn register(line: usize) {
     }
 }
 
-/// Следит за одной линией монетоприёмника.
+/// Как часто опрашивать линии в покое.
 ///
-/// Задача на линию, а не одна на все шесть: так каждая обрабатывается
-/// независимо, и монета, пришедшая по второй линии во время выдержки по
-/// первой, не теряется.
-#[embassy_executor::task(pool_size = coin::LINES)]
-pub async fn coin_line_task(mut pin: Flex<'static>, line: usize) -> ! {
-    let mut mask_rx = unwrap!(BLOCK_MASK.receiver());
-    let mut mask = mask_rx.try_get().unwrap_or(0);
+/// Импульс длится 100 мс, так что 5 мс дают двадцатикратный запас и стоят
+/// сущие копейки процессорного времени.
+const POLL: Duration = Duration::from_millis(5);
 
-    loop {
-        if coin::is_blocked(mask, line) {
-            // Удерживаем линию в нуле — для приёмника это и есть блокировка
-            // канала. Высокий уровень не выдаём никогда: с той стороны
-            // открытый коллектор.
+/// Сколько ждать от первого спада до снятия кода.
+///
+/// Биты кода зажигаются не идеально одновременно, и снять код сразу — значит
+/// прочитать половину: евро (`0b101`) легко превратится в лат (`0b001`).
+/// 25 мс заведомо больше разбега фронтов и заведомо меньше импульса в 100 мс.
+const SETTLE: Duration = Duration::from_millis(25);
+
+/// Снять код со всех линий разом.
+///
+/// Заблокированные исключаем: мы сами удерживаем их в нуле, и без этого наша
+/// же блокировка читалась бы как нажатая линия.
+fn sample(pins: &[Flex<'static>; coin::LINES], blocked: u8) -> u8 {
+    let mut code = 0u8;
+    for (index, pin) in pins.iter().enumerate() {
+        if pin.is_low() && !coin::is_blocked(blocked, index) {
+            code |= 1 << index;
+        }
+    }
+    code
+}
+
+/// Привести линии в состояние, заданное маской блокировки.
+fn apply_mask(pins: &mut [Flex<'static>; coin::LINES], blocked: u8) {
+    for (index, pin) in pins.iter_mut().enumerate() {
+        if coin::is_blocked(blocked, index) {
+            // Удерживаем в нуле — для приёмника это и есть блокировка канала.
+            // Высокий уровень не выдаём никогда: с той стороны открытый
+            // коллектор, и в момент импульса он потянет линию к земле против
+            // нашего выхода.
             pin.set_low();
             pin.set_as_output();
+        } else {
+            pin.set_as_input();
+            pin.set_pull(Pull::Up);
+        }
+    }
+}
 
-            // Ждём, пока линию не разблокируют.
-            while coin::is_blocked(mask, line) {
-                mask = mask_rx.changed().await;
-            }
+/// Следит за монетоприёмником: снимает код с линий и засчитывает монету.
+///
+/// # Почему одна задача, а не шесть
+///
+/// Потому что монета опознаётся **кодом на нескольких линиях сразу**, а не
+/// линией. Шесть независимых задач засчитали бы одно евро (`0b101`) дважды —
+/// по разу на каждый зажёгшийся пин.
+///
+/// # Почему опрос, а не ожидание фронта
+///
+/// Ждать фронта пришлось бы на шести выводах одновременно, а потом всё равно
+/// выдерживать паузу на разбег битов кода. При импульсе в 100 мс опрос раз в
+/// [`POLL`] проще, надёжнее и ничего не стоит.
+#[embassy_executor::task]
+pub async fn coin_task(mut pins: [Flex<'static>; coin::LINES]) -> ! {
+    let mut mask_rx = unwrap!(BLOCK_MASK.receiver());
+    let mut blocked = mask_rx.try_get().unwrap_or(0);
+    apply_mask(&mut pins, blocked);
+
+    loop {
+        if let Some(updated) = mask_rx.try_changed() {
+            blocked = updated;
+            apply_mask(&mut pins, blocked);
+        }
+
+        if sample(&pins, blocked) == 0 {
+            Timer::after(POLL).await;
             continue;
         }
 
-        pin.set_as_input();
-        pin.set_pull(Pull::Up);
+        // Импульс начался — даём коду установиться и снимаем его целиком.
+        Timer::after(SETTLE).await;
+        let code = sample(&pins, blocked);
 
-        match embassy_futures::select::select(pin.wait_for_falling_edge(), mask_rx.changed()).await {
-            embassy_futures::select::Either::First(()) => {
-                Timer::after(DEBOUNCE).await;
-                if pin.is_low() {
-                    register(line);
-                    // Пока линия не отпущена, новых монет по ней быть не может.
-                    pin.wait_for_high().await;
-                }
-            }
-            embassy_futures::select::Either::Second(updated) => mask = updated,
+        match coin::lookup(config::COINS, code) {
+            Some(found) => register(found),
+            None if code == 0 => debug!("COIN: импульс пропал, помеха"),
+            None => warn!(
+                "COIN: неизвестный код 0b{:06b} — впишите его в config::COINS",
+                code
+            ),
+        }
+
+        // Пока линии не отпущены, новой монеты быть не может.
+        while sample(&pins, blocked) != 0 {
+            Timer::after(POLL).await;
         }
     }
 }
