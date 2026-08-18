@@ -2,5 +2,13 @@
 *.svg
 *-erc.rpt
 net.txt
+
+# Служебное KiCad: блокировки открытого проекта и локальные настройки вида.
+*.lck
+*.kicad_prl
 *-backups/
 fp-info-cache
+
+# Служебное окружения.
+__pycache__/
+.history/
