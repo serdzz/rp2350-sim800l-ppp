@@ -24,6 +24,8 @@ from fp import load_fp, fp_pads
 
 PROJECT = "nri-g13-shifter"
 TRACE = 0.3          # минимум по умолчанию в KiCad — 0.254 мм
+POWER = 0.8          # питание: ток тут копеечный, ширина — ради надёжности
+RAIL = 1.2           # магистральные шины 3.3 В и 12 В
 CLEAR = 0.2
 VIA_D, VIA_DRILL = 1.0, 0.6   # минимумы KiCad: 0.889 и 0.508
 
@@ -192,9 +194,16 @@ def place_fp(ref, x, y, rot=0):
     emit("\t" + text.replace("\n", "\n\t"))
 
 
-def seg(x1, y1, x2, y2, net, layer="F.Cu", width=TRACE):
+POWER_NETS = ("+3V3", "+12V", "GND")
+
+
+def seg(x1, y1, x2, y2, net, layer="F.Cu", width=None):
     if (x1, y1) == (x2, y2):
         return
+    # Ширину выбираем по цепи, а не руками на каждом вызове: так её нельзя
+    # забыть на одном отводе из семнадцати.
+    if width is None:
+        width = POWER if net in POWER_NETS else TRACE
     emit(f'\t(segment\n\t\t(start {round(x1,4)} {round(y1,4)}) '
          f'(end {round(x2,4)} {round(y2,4)})\n\t\t(width {width}) '
          f'(layer "{layer}") (net {NET_ID[net]})\n\t\t(uuid "{uid("s")}")\n\t)')
@@ -210,6 +219,26 @@ def via(x, y, net):
     emit(f'\t(via\n\t\t(at {round(x,4)} {round(y,4)}) (size {VIA_D}) '
          f'(drill {VIA_DRILL})\n\t\t(layers "F.Cu" "B.Cu") (net {NET_ID[net]})'
          f'\n\t\t(uuid "{uid("v")}")\n\t)')
+
+
+def zone(net, x0, y0, x1, y1, layers=("F.Cu", "B.Cu")):
+    """Полигон заливки. Одна запись может занимать оба слоя сразу.
+
+    `island_removal_mode 0` — выбрасывать куски, не связанные с цепью. На
+    плотной плате заливка неизбежно режется дорожками, и кусок без связи —
+    это не земля, а антенна.
+    """
+    pts = " ".join(f"(xy {x} {y})" for x, y in
+                   ((x0, y0), (x1, y0), (x1, y1), (x0, y1)))
+    lay = " ".join(f'"{l}"' for l in layers)
+    emit(f'\t(zone\n\t\t(net {NET_ID[net]}) (net_name "{net}")\n'
+         f'\t\t(layers {lay})\n'
+         f'\t\t(uuid "{uid("z")}") (name "{net}") (hatch edge 0.5)\n'
+         f'\t\t(connect_pads (clearance 0.3))\n'
+         f'\t\t(min_thickness 0.25) (filled_areas_thickness no)\n'
+         f'\t\t(fill (thermal_gap 0.4) (thermal_bridge_width 0.4)\n'
+         f'\t\t\t(island_removal_mode 0))\n'
+         f'\t\t(polygon (pts {pts}))\n\t)')
 
 
 def edge(x1, y1, x2, y2):
@@ -242,8 +271,8 @@ for net, x, y1, y2 in ((N3, X_V3A, Y_P3V3, ROWS[5] + DY_LED),
                        (N3, X_V3B, Y_LINK, 78),
                        (N12, X_V12, 8, 79),
                        (NG, X_GND, Y_PGND, 82)):
-    seg(x, y1, x, y2, net, "B.Cu", 0.5)
-seg(X_V3A, Y_LINK, X_V3B, Y_LINK, N3, "B.Cu", 0.5)   # две шины 3.3 В
+    seg(x, y1, x, y2, net, "B.Cu", RAIL)
+seg(X_V3A, Y_LINK, X_V3B, Y_LINK, N3, "B.Cu", RAIL)   # две шины 3.3 В
 
 for i, yc in enumerate(ROWS):
     gp, line = "/" + CH[i][0], "/" + CH[i][1]
@@ -284,9 +313,9 @@ for i, yc in enumerate(ROWS):
     px, py = P("J2", str(i + 5))
     path([(px, py), (6, py), (12, yc + DY_GP), (X_FAN, yc + DY_GP)], "/" + CH[i][0])
 
-path([P("J2", "1"), (2.5, P("J2", "1")[1]), (2.5, Y_P12), (X_V12, Y_P12)], N12)
+path([P("J2", "1"), (2.6, P("J2", "1")[1]), (2.6, Y_P12), (X_V12, Y_P12)], N12)
 via(X_V12, Y_P12, N12)
-path([P("J2", "3"), (1.5, P("J2", "3")[1]), (1.5, Y_P3V3), (X_V3A, Y_P3V3)], N3)
+path([P("J2", "3"), (1.2, P("J2", "3")[1]), (1.2, Y_P3V3), (X_V3A, Y_P3V3)], N3)
 via(X_V3A, Y_P3V3, N3)
 for pin in ("2", "4", "12"):
     path([P("J2", pin), (X_GND, P("J2", pin)[1])], NG, "B.Cu")
@@ -332,6 +361,25 @@ for ref, y in (("C2", 76), ("C3", 79)):
     path([P(ref, "1"), (X_V12, y)], N12)
     via(X_V12, y, N12)
     path([P(ref, "2"), (P(ref, "2")[0], 82)], NG)
+
+# Заливка землёй по обоим слоям. Дорожки земли под ней оставлены намеренно:
+# на плотной плате заливка рвётся на куски, и надеяться, что все они окажутся
+# связаны, нельзя — а дорожка связывает гарантированно.
+zone(NG, BOARD[0] + 0.5, BOARD[1] + 0.5, BOARD[2] - 0.5, BOARD[3] - 0.5)
+
+# Сшивающие отверстия. Ставятся строго на существующую медь земли: висящее
+# в заливке отверстие связью не считается — ни для DRC, ни на плате, если
+# заливка вокруг него окажется отрезанной.
+#
+# По вертикали — на шину земли, в просветы между полосой индикатора и
+# магистралью канала. По горизонтали — на верхнюю и нижнюю дорожки земли,
+# в стороне от вертикальных шин питания.
+for yc in ROWS:
+    via(X_GND, yc - 1.275, NG)
+for x in (43, 50, 64):
+    via(x, Y_PGND, NG)
+for x in (31, 43, 52):
+    via(x, 82, NG)
 
 # Контур платы и надписи.
 x0, y0, x1, y1 = BOARD
