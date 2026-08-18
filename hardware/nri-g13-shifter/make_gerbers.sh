@@ -29,7 +29,7 @@ mkdir -p assembly
 kicad-cli sch export bom \
     --fields 'Value,Reference,Footprint,LCSC,${QUANTITY}' \
     --labels 'Comment,Designator,Footprint,LCSC Part #,Qty' \
-    --group-by 'Value,Footprint' --exclude-dnp \
+    --group-by 'Value,Footprint' --exclude-dnp --ref-range-delimiter '' \
     -o assembly/bom.csv "$BOARD.kicad_sch"
 
 # --exclude-fp-th: выводные разъёмы на автоматический монтаж не идут, и
@@ -39,24 +39,28 @@ kicad-cli pcb export pos --format csv --units mm --side both \
     --exclude-dnp --exclude-fp-th \
     -o assembly/cpl.csv "$BOARD.kicad_pcb"
 
+# KiCad и JLCPCB называют одни и те же колонки по-разному, и завод на своём
+# файле спотыкается молча: «File processing failed» без подробностей.
+python3 - <<'PYEOF'
+import csv
+rows = list(csv.DictReader(open("assembly/cpl.csv")))
+with open("assembly/cpl.csv", "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["Designator", "Mid X", "Mid Y", "Rotation", "Layer"])
+    for r in rows:
+        w.writerow([r["Ref"], f'{float(r["PosX"]):.4f}', f'{float(r["PosY"]):.4f}',
+                    f'{float(r["Rot"]):.2f}', r["Side"].capitalize()])
+PYEOF
+
 # Перечень приводим ровно к тому, что ставит станок: строка в перечне без
 # координат установки — это лишний вопрос от завода.
 python3 - <<'PYEOF'
 import csv
-placed = {r["Ref"] for r in csv.DictReader(open("assembly/cpl.csv"))}
+placed = {r["Designator"] for r in csv.DictReader(open("assembly/cpl.csv"))}
 rows = list(csv.DictReader(open("assembly/bom.csv")))
 keep = []
 for r in rows:
-    refs = [x for x in r["Designator"].replace(" ", "").split(",")]
-    expanded = []
-    for x in refs:
-        if "-" in x:                      # диапазон вида D1-D6
-            a, b = x.split("-")
-            pre = "".join(c for c in a if c.isalpha())
-            expanded += [f"{pre}{i}" for i in range(int(a[len(pre):]), int(b[len(pre):]) + 1)]
-        else:
-            expanded.append(x)
-    if any(e in placed for e in expanded):
+    if any(x in placed for x in r["Designator"].replace(" ", "").split(",")):
         keep.append(r)
 with open("assembly/bom.csv", "w", newline="") as f:
     w = csv.DictWriter(f, fieldnames=rows[0].keys(), quoting=csv.QUOTE_ALL)
