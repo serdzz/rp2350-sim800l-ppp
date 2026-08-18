@@ -14,3 +14,6 @@ __pycache__/
 .history/
 pcb.svg
 *-drc.rpt
+
+# Карты сверловки: pdf пересоздаётся, в репозитории не нужен.
+gerber/*.pdf
