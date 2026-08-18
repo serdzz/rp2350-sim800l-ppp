@@ -27,8 +27,8 @@ kicad-cli pcb export drill \
 # узнать об этом из примечания в письме.
 mkdir -p assembly
 kicad-cli sch export bom \
-    --fields 'Value,Reference,Footprint,${QUANTITY}' \
-    --labels 'Comment,Designator,Footprint,Qty' \
+    --fields 'Value,Reference,Footprint,LCSC,${QUANTITY}' \
+    --labels 'Comment,Designator,Footprint,LCSC Part #,Qty' \
     --group-by 'Value,Footprint' --exclude-dnp \
     -o assembly/bom.csv "$BOARD.kicad_sch"
 

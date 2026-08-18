@@ -192,6 +192,20 @@ def uid(tag=""):
 
 ROOT = uid("root")
 
+# Артикулы склада JLCPCB. Все сверены по каталогу, а не восстановлены по
+# памяти: неверный код — это не опечатка, а другая деталь на плате.
+#
+# Резисторы и конденсаторы из «базового» набора, за них не берут отдельную
+# плату за настройку станка. BSS138 — расширенная позиция, и заменять его на
+# базовый 2N7002 не стоит: у того порог отпирания вдвое выше, а весь смысл
+# каскада в том, чтобы он открывался от 3.3 В.
+LCSC_10K = "C25804"       # 10 кОм 0603 1%
+LCSC_1K = "C21190"        # 1 кОм 0603 1%
+LCSC_100N = "C14663"      # 100 нФ 50 В 0603 X7R
+LCSC_1U = "C15849"        # 1 мкФ 50 В 0603
+LCSC_LED = "C72043"       # светодиод зелёный 0603
+LCSC_BSS138 = "C78284"    # BSS138 SOT-23, порог 0.8 В
+
 # --- Что за плата ---------------------------------------------------------
 
 # Каналы: цепь со стороны платы, цепь со стороны приёмника, контакт разъёма
@@ -290,7 +304,7 @@ def text(s, x, y, size=2.5):
          f'\t\t(uuid "{uid("t")}")\n\t)')
 
 
-def place(key, ref, value, x, y, footprint="", dnp=False, prop=(5.08, -1.27)):
+def place(key, ref, value, x, y, footprint="", dnp=False, prop=(5.08, -1.27), lcsc=""):
     """Поставить компонент и вернуть координаты его выводов в схеме.
 
     `prop` — куда отнести позиционное обозначение и номинал. У разъёмов
@@ -326,6 +340,10 @@ def place(key, ref, value, x, y, footprint="", dnp=False, prop=(5.08, -1.27)):
 \t\t\t(effects (font (size 1.27 1.27)) (hide yes))
 \t\t)
 \t\t(property "Datasheet" "~"
+\t\t\t(at {x} {y} 0)
+\t\t\t(effects (font (size 1.27 1.27)) (hide yes))
+\t\t)
+\t\t(property "LCSC" "{lcsc}"
 \t\t\t(at {x} {y} 0)
 \t\t\t(effects (font (size 1.27 1.27)) (hide yes))
 \t\t)
@@ -397,11 +415,13 @@ for i, kind in enumerate(("+3V3", "+12V", "GND")):
     pwr_flag(kind, (14 + 5 * i) * U, 43 * U)
 
 # Развязка по питанию.
-for i, (kind, val, ref) in enumerate((("+3V3", "100n", "C1"),
-                                      ("+12V", "100n", "C2"),
-                                      ("+12V", "10u", "C3"))):
+# 1 мкФ, а не 10: в корпусе 0603 десять микрофарад бывают только на 10 В, а
+# эта банка сидит на шине 12 В. Ток тут копеечный, ёмкости хватает с запасом.
+for i, (kind, val, ref, code) in enumerate((("+3V3", "100n", "C1", LCSC_100N),
+                                            ("+12V", "100n", "C2", LCSC_100N),
+                                            ("+12V", "1u", "C3", LCSC_1U))):
     x = (38 + 5 * i) * U
-    p = place("C", ref, val, x, 40 * U, "Capacitor_SMD:C_0603_1608Metric")
+    p = place("C", ref, val, x, 40 * U, "Capacitor_SMD:C_0603_1608Metric", lcsc=code)
     wire(*p["1"], x, 37 * U)
     rail(kind, x, 37 * U)
     wire(*p["2"], x, 43 * U)
@@ -415,7 +435,8 @@ for i, (gp, line, _pin, caption) in enumerate(CHANNELS):
 
     # Преобразователь уровней. Затвор на 3.3 В, исток к плате, сток к
     # приёмнику — так BSS138 работает в обе стороны.
-    q = place("Q", f"Q{i+1}", "BSS138", x, 44 * U, "Package_TO_SOT_SMD:SOT-23")
+    q = place("Q", f"Q{i+1}", "BSS138", x, 44 * U, "Package_TO_SOT_SMD:SOT-23",
+              lcsc=LCSC_BSS138)
     gx, gy = q["1"]
     wire(gx, gy, gx - 3 * U, gy)
     rail("+3V3", gx - 3 * U, gy)
@@ -431,7 +452,8 @@ for i, (gp, line, _pin, caption) in enumerate(CHANNELS):
     # Подтяжка со стороны платы. Встроенной в RP2350 хватило бы, но 10 кОм
     # надёжнее на проводах внутри корпуса автомата. Для GP9 этот же резистор
     # держит вход блокировки закрытым, пока контроллер в сбросе.
-    r = place("R", f"R{i+1}", "10k", sx, 57 * U, "Resistor_SMD:R_0603_1608Metric")
+    r = place("R", f"R{i+1}", "10k", sx, 57 * U, "Resistor_SMD:R_0603_1608Metric",
+              lcsc=LCSC_10K)
     wire(*r["1"], sx, 54 * U)
     rail("+3V3", sx, 54 * U)
     wire(*r["2"], sx, 60 * U)
@@ -442,7 +464,7 @@ for i, (gp, line, _pin, caption) in enumerate(CHANNELS):
     # блокировки обязательна: без неё уровень блокировки не наберётся.
     inhibit = line == "INHIBIT"
     r = place("R", f"R{i+11}", "10k", dx, 28 * U,
-              "Resistor_SMD:R_0603_1608Metric", dnp=not inhibit)
+              "Resistor_SMD:R_0603_1608Metric", dnp=not inhibit, lcsc=LCSC_10K)
     wire(*r["1"], dx, 25 * U)
     rail("+12V", dx, 25 * U)
     wire(*r["2"], dx, 31 * U)
@@ -453,13 +475,15 @@ for i, (gp, line, _pin, caption) in enumerate(CHANNELS):
     # она там стоит.
     if inhibit:
         continue
-    d = place("LED", f"D{i+1}", "LED", sx, 71 * U, "LED_SMD:LED_0603_1608Metric")
+    d = place("LED", f"D{i+1}", "LED", sx, 71 * U, "LED_SMD:LED_0603_1608Metric",
+              lcsc=LCSC_LED)
     kx, ky = d["1"]
     wire(kx, ky, kx - 3 * U, ky)
     label(gp, kx - 3 * U, ky)
     ax, ay = d["2"]
     wire(ax, ay, ax + 3 * U, ay)
-    r = place("R", f"R{i+21}", "1k", ax + 3 * U, 67 * U, "Resistor_SMD:R_0603_1608Metric")
+    r = place("R", f"R{i+21}", "1k", ax + 3 * U, 67 * U, "Resistor_SMD:R_0603_1608Metric",
+              lcsc=LCSC_1K)
     wire(ax + 3 * U, ay, *r["2"])
     wire(*r["1"], ax + 3 * U, 64 * U)
     rail("+3V3", ax + 3 * U, 64 * U)

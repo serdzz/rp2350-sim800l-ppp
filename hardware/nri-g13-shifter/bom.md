@@ -4,7 +4,7 @@
 |---|---|---|---|
 | C1 | 100n | C_0603_1608Metric | да |
 | C2 | 100n | C_0603_1608Metric | да |
-| C3 | 10u | C_0603_1608Metric | да |
+| C3 | 1u | C_0603_1608Metric | да |
 | D1 | LED | LED_0603_1608Metric | да |
 | D2 | LED | LED_0603_1608Metric | да |
 | D3 | LED | LED_0603_1608Metric | да |

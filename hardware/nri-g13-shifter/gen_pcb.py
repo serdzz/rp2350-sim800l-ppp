@@ -54,7 +54,7 @@ def read_netlist(path="net.txt"):
 
 
 def read_components(path="net.txt"):
-    """Обозначение -> номинал, посадочное место, признак «не ставить».
+    """Обозначение -> номинал, посадочное место, «не ставить», артикул склада.
 
     Всё берётся из нетлиста, а не задаётся здесь: разойтись со схемой не может.
     """
@@ -66,7 +66,8 @@ def read_components(path="net.txt"):
         val = re.search(r'\(value "([^"]*)"\)', blk).group(1)
         fp = re.search(r'\(footprint "([^"]+)"\)', blk).group(1)
         dnp = '(name "dnp")' in blk
-        out[ref] = (val, fp, dnp)
+        m = re.search(r'\(name "LCSC"\) "([^"]*)"', blk)
+        out[ref] = (val, fp, dnp, m.group(1) if m else "")
     return out
 
 
@@ -142,7 +143,7 @@ def place_fp(ref, x, y, rot=0):
     возиться с матрицей поворота, где легко ошибиться незаметно.
     """
     assert rot in (0, 180)
-    value, fp, dnp = COMP[ref]
+    value, fp, dnp, lcsc = COMP[ref]
     lib, name = fp.split(":")
     text, tree = load_fp(lib, name)
     pads = fp_pads(tree)
@@ -178,6 +179,9 @@ def place_fp(ref, x, y, rot=0):
     text = text.replace('"Reference" "REF**"', f'"Reference" "{ref}"', 1)
     text = re.sub(r'\(property "Value" "[^"]*"', f'(property "Value" "{value}"',
                   text, count=1)
+    # Артикул склада переносим и в плату: сверка со схемой иначе считает поле
+    # потерянным, а на монтаж уедет плата без указания, что ставить.
+    text = text.replace("\n\t(attr", '\n\t(property "LCSC" "{lcsc}"\n\t\t(at 0 0 0)\n\t\t(unlocked yes) (layer "F.Fab") (hide yes)\n\t\t(uuid "{u}")\n\t\t(effects (font (size 1 1) (thickness 0.15)))\n\t)\n\t(attr'.format(lcsc=lcsc, u=uid("pl")), 1)
     # «Не ставить» должно совпадать со схемой, иначе сверка ругается, а на
     # производство уедет лишняя деталь.
     if dnp:
