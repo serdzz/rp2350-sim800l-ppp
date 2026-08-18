@@ -2,8 +2,6 @@
 "100n","C1,C2","Capacitor_SMD:C_0603_1608Metric","C14663","2"
 "1u","C3","Capacitor_SMD:C_0603_1608Metric","C15849","1"
 "LED","D1-D6","LED_SMD:LED_0603_1608Metric","C72043","6"
-"NRI G-13 (10 pin)","J1","Connector_IDC:IDC-Header_2x05_P2.54mm_Vertical","","1"
-"RP2350-Plus + 12V","J2","Connector_PinHeader_2.54mm:PinHeader_1x12_P2.54mm_Vertical","","1"
 "BSS138","Q1-Q7","Package_TO_SOT_SMD:SOT-23","C78284","7"
 "10k","R1-R7,R17","Resistor_SMD:R_0603_1608Metric","C25804","8"
 "1k","R21-R26","Resistor_SMD:R_0603_1608Metric","C21190","6"
