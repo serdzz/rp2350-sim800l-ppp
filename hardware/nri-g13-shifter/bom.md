@@ -12,8 +12,7 @@
 | D5 | LED | LED_0603_1608Metric | да |
 | D6 | LED | LED_0603_1608Metric | да |
 | J1 | NRI G-13 (10 pin) | IDC-Header_2x05_P2.54mm_Vertical | да |
-| J2 | RP2350-Plus | PinHeader_1x10_P2.54mm_Vertical | да |
-| J3 | +12V IN | TerminalBlock_Phoenix_MKDS-1,5-2-5.08_1x02_P5.08mm_Horizontal | да |
+| J2 | RP2350-Plus + 12V | PinHeader_1x12_P2.54mm_Vertical | да |
 | Q1 | BSS138 | SOT-23 | да |
 | Q2 | BSS138 | SOT-23 | да |
 | Q3 | BSS138 | SOT-23 | да |

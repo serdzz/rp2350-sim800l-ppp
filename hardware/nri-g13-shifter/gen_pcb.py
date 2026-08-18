@@ -81,20 +81,30 @@ def net_of(ref, pad):
 
 # --- Геометрия ------------------------------------------------------------
 
-ROWS = [24 + i * 10 for i in range(7)]      # центр строки канала
+ROWS = [22 + i * 8 for i in range(7)]        # центр строки канала
 CH = [("GP3", "LINE1"), ("GP4", "LINE2"), ("GP5", "LINE3"), ("GP6", "LINE4"),
       ("GP7", "LINE5"), ("GP8", "LINE6"), ("GP9", "INHIBIT")]
 
-X_J2, X_LED, X_RLED = 6.0, 20.0, 26.0
-X_GND, X_V3A, X_V3B, X_V12 = 32.0, 36.0, 48.0, 70.0
-X_R3V3, X_Q, X_R12 = 42.0, 54.0, 64.0
-X_JOG_IN, X_CHAN = 57.0, 76.0
-X_J1 = 88.0
+# Разметка по горизонтали. Слева гребёнка, справа приёмник, между ними по
+# порядку: индикатор, шины питания, подтяжка, полевик, вторая подтяжка.
+X_J2, X_FAN = 4.0, 13.0
+X_LED, X_RLED = 16.0, 21.0
+X_GND, X_V3A, X_V3B, X_V12 = 25.0, 28.0, 37.0, 55.0
+X_R3V3, X_Q, X_R12 = 33.0, 43.0, 51.0
+X_JOG_IN, X_CHAN = 46.0, 58.0
+X_J1 = 72.0
 
-Y_J2 = 42.57          # верхний вывод гребёнки
-Y_J3 = 12.0
-BOARD = (0.0, 5.0, 96.0, 97.0)
+Y_J2 = 32.03          # гребёнка на 12 контактов, по центру строк
+Y_J1 = 40.92
+# Полосы питания поверх строк. Порядок важен: цепь с внешней вертикалью
+# обязана уходить выше, иначе её горизонталь пересечёт внутреннюю вертикаль.
+Y_P3V3, Y_P12, Y_PGND, Y_LINK = 8.0, 12.0, 14.0, 16.0
+BOARD = (0.0, 6.0, 78.0, 85.0)
 
+# Смещения внутри строки. Полосы не перекрываются по x, поэтому строку
+# удалось сжать до 8 мм: индикатор и отвод к разъёму делят одну высоту.
+DY_GATE, DY_LINE, DY_GP = -0.95, 0.0, 0.95
+DY_R3V3, DY_LED, DY_JOG = 2.5, -3.5, -3.2
 
 out = []
 pads_abs = {}      # (ref, pad) -> (x, y)
@@ -222,20 +232,18 @@ def P(ref, pad):
 
 N3, N12, NG = "+3V3", "+12V", "GND"
 
-place_fp("J1", X_J1, 44.92)
+place_fp("J1", X_J1, Y_J1)
 place_fp("J2", X_J2, Y_J2)
-place_fp("J3", X_J2, Y_J3)
 
 # Шины питания: вертикальные, по низу. Сигналы идут горизонтально по верху,
-# поэтому пересечься они не могут в принципе.
-RAILS = {N3: [(X_V3A, 17, 88), (X_V3B, 17, 86.7)],
-         N12: [(X_V12, 9, 90)],
-         NG: [(X_GND, 12, 93)]}
-for net, runs in RAILS.items():
-    for x, y1, y2 in runs:
-        seg(x, y1, x, y2, net, "B.Cu", 0.5)
-# Две шины 3.3 В соединяются поверху, где строк ещё нет.
-seg(X_V3A, 17, X_V3B, 17, N3, "B.Cu", 0.5)
+# поэтому пересечься они не могут в принципе. Границы — по крайним
+# подключениям: лишний хвост KiCad считает висящим.
+for net, x, y1, y2 in ((N3, X_V3A, Y_P3V3, ROWS[5] + DY_LED),
+                       (N3, X_V3B, Y_LINK, 78),
+                       (N12, X_V12, 8, 79),
+                       (NG, X_GND, Y_PGND, 82)):
+    seg(x, y1, x, y2, net, "B.Cu", 0.5)
+seg(X_V3A, Y_LINK, X_V3B, Y_LINK, N3, "B.Cu", 0.5)   # две шины 3.3 В
 
 for i, yc in enumerate(ROWS):
     gp, line = "/" + CH[i][0], "/" + CH[i][1]
@@ -243,103 +251,94 @@ for i, yc in enumerate(ROWS):
     place_fp(q, X_Q, yc)
     # Поворот на 180: у резисторов вывод 1 сидит на питании, а шина питания
     # по разводке всегда с противоположной стороны от сигнала.
-    place_fp(r3, X_R3V3, yc + 2.7, rot=180)
+    place_fp(r3, X_R3V3, yc + DY_R3V3, rot=180)
     place_fp(r12, X_R12, yc, rot=180)
 
-    y_gp = yc + 0.95                      # исток BSS138 и вся линия к плате
-    path([(17, y_gp), P(q, "2")], gp)     # магистраль канала
-    path([(39, y_gp), (39, yc + 2.7), P(r3, "2")], gp)
-    path([P(r3, "1"), (X_V3B, yc + 2.7)], N3)
-    via(X_V3B, yc + 2.7, N3)
-    path([P(q, "1"), (X_V3B, yc - 0.95)], N3)   # затвор на 3.3 В
-    via(X_V3B, yc - 0.95, N3)
+    y_gp = yc + DY_GP
+    path([(X_FAN, y_gp), P(q, "2")], gp)                 # магистраль канала
+    path([(30, y_gp), (30, yc + DY_R3V3), P(r3, "2")], gp)
+    path([P(r3, "1"), (X_V3B, yc + DY_R3V3)], N3)
+    via(X_V3B, yc + DY_R3V3, N3)
+    path([P(q, "1"), (X_V3B, yc + DY_GATE)], N3)         # затвор на 3.3 В
+    via(X_V3B, yc + DY_GATE, N3)
 
-    path([P(q, "3"), P(r12, "2")], line)        # сток на сторону приёмника
+    path([P(q, "3"), P(r12, "2")], line)                 # сток к приёмнику
     path([P(r12, "1"), (X_V12, yc)], N12)
     via(X_V12, yc, N12)
     # Отвод к разъёму обходит R12 сверху: в линию его не поставить, там уже
     # сидит сток.
-    path([(X_JOG_IN, yc), (X_JOG_IN, yc - 3.2), (X_CHAN, yc - 3.2)], line)
+    path([(X_JOG_IN, yc), (X_JOG_IN, yc + DY_JOG), (X_CHAN, yc + DY_JOG)], line)
 
     if i < 6:
         led, rled = f"D{i+1}", f"R{i+21}"
-        place_fp(led, X_LED, yc + 5)
-        place_fp(rled, X_RLED, yc + 5, rot=180)
-        path([(17, y_gp), (17, yc + 5), P(led, "1")], gp)
+        place_fp(led, X_LED, yc + DY_LED)
+        place_fp(rled, X_RLED, yc + DY_LED, rot=180)
+        path([(X_FAN, y_gp), (X_FAN, yc + DY_LED), P(led, "1")], gp)
         path([P(led, "2"), P(rled, "2")], net_of(led, "2"))
-        path([P(rled, "1"), (X_V3A, yc + 5)], N3)
-        via(X_V3A, yc + 5, N3)
+        path([P(rled, "1"), (X_V3A, yc + DY_LED)], N3)
+        via(X_V3A, yc + DY_LED, N3)
 
-# Разбор гребёнки платы. Выводы и строки идут в одном порядке, поэтому веер
+# Разбор гребёнки. Её выводы и строки идут в одном порядке, поэтому веер
 # получается непересекающимся сам собой.
 for i, yc in enumerate(ROWS):
-    px, py = P("J2", str(i + 3))
-    path([(px, py), (8, py), (16, yc + 0.95), (17, yc + 0.95)], "/" + CH[i][0])
+    px, py = P("J2", str(i + 5))
+    path([(px, py), (6, py), (12, yc + DY_GP), (X_FAN, yc + DY_GP)], "/" + CH[i][0])
 
-path([P("J2", "1"), (3, 42.57), (3, 20), (X_V3A, 20)], N3)
-via(X_V3A, 20, N3)
-for pin in ("2", "10"):
+path([P("J2", "1"), (2.5, P("J2", "1")[1]), (2.5, Y_P12), (X_V12, Y_P12)], N12)
+via(X_V12, Y_P12, N12)
+path([P("J2", "3"), (1.5, P("J2", "3")[1]), (1.5, Y_P3V3), (X_V3A, Y_P3V3)], N3)
+via(X_V3A, Y_P3V3, N3)
+for pin in ("2", "4", "12"):
     path([P("J2", pin), (X_GND, P("J2", pin)[1])], NG, "B.Cu")
-
-path([P("J3", "1"), (6, 9), (X_V12, 9)], N12)
-via(X_V12, 9, N12)
-path([P("J3", "2"), (X_GND, Y_J3)], NG, "B.Cu")
 
 # Разбор разъёма приёмника. Порядок контактов там свой, и в строки он ложится
 # с перехлёстом, поэтому половина уходит на нижний слой: внутри каждой
 # половины порядок уже монотонный и пересечений нет.
-UP = [("7", 84, 0), ("8", 82, 1), ("9", 80, 2), ("10", 78, 3)]
-DOWN = [("3", 78, 4), ("4", 80, 5), ("6", 82, 6)]
-MIDGAP = {"8": 53.81, "10": 56.35, "4": 48.73, "6": 51.27}
+UP = [("7", 67, 0), ("8", 65, 1), ("9", 63, 2), ("10", 61, 3)]
+DOWN = [("3", 61, 4), ("4", 63, 5), ("6", 65, 6)]
+MIDGAP = {"8": 49.81, "10": 52.35, "4": 44.73, "6": 47.27}
+
+
+def escape(pin, lane, row, layer):
+    px, py = P("J1", pin)
+    pts = [(px, py)]
+    if pin in MIDGAP:
+        pts.append((px, MIDGAP[pin]))
+    y_jog = ROWS[row] + DY_JOG
+    pts += [(lane, pts[-1][1]), (lane, y_jog), (X_CHAN, y_jog)]
+    path(pts, "/" + CH[row][1], layer)
+    return y_jog
+
 
 for pin, lane, row in UP:
-    px, py = P("J1", pin)
-    pts = [(px, py)]
-    if pin in MIDGAP:
-        pts += [(px, MIDGAP[pin])]
-    y_jog = ROWS[row] - 3.2
-    pts += [(lane, pts[-1][1]), (lane, y_jog), (X_CHAN, y_jog)]
-    path(pts, "/" + CH[row][1])
-
+    escape(pin, lane, row, "F.Cu")
 for pin, lane, row in DOWN:
-    px, py = P("J1", pin)
-    pts = [(px, py)]
-    if pin in MIDGAP:
-        pts += [(px, MIDGAP[pin])]
-    y_jog = ROWS[row] - 3.2
-    pts += [(lane, pts[-1][1]), (lane, y_jog), (X_CHAN, y_jog)]
-    path(pts, "/" + CH[row][1], "B.Cu")
-    via(X_CHAN, y_jog, "/" + CH[row][1])
+    via(X_CHAN, escape(pin, lane, row, "B.Cu"), "/" + CH[row][1])
 
 # Питание разъёма приёмника уводим поверх строк: там пусто.
-path([P("J1", "1"), (X_J1, 16), (X_GND, 16)], NG)
-via(X_GND, 16, NG)
-path([P("J1", "2"), (90.54, 14), (X_V12, 14)], N12, "B.Cu")
+path([P("J1", "1"), (X_J1, Y_PGND), (X_GND, Y_PGND)], NG)
+via(X_GND, Y_PGND, NG)
+path([P("J1", "2"), (74.54, 8), (X_V12, 8)], N12, "B.Cu")
 
 # Развязка.
-place_fp("C1", 34, 88, rot=180)
-path([P("C1", "1"), (X_V3A, 88)], N3)
-via(X_V3A, 88, N3)
-path([P("C1", "2"), (X_GND, 88)], NG)
-via(X_GND, 88, NG)
-
-seg(X_GND, 93, 74.775, 93, NG)          # общая шина земли под строками
-via(X_GND, 93, NG)
-place_fp("C2", 66, 90, rot=180)
-place_fp("C3", 74, 90)
-path([P("C2", "1"), (X_V12, 90)], N12)
-via(X_V12, 90, N12)
-path([P("C2", "2"), (P("C2", "2")[0], 93)], NG)
-path([P("C3", "1"), (X_V12, 90)], N12)
-path([P("C3", "2"), (P("C3", "2")[0], 93)], NG)
+seg(X_GND, 82, 58.775, 82, NG)          # общая земля под строками
+place_fp("C1", X_R3V3, 78, rot=180)
+path([P("C1", "1"), (X_V3B, 78)], N3)
+via(X_V3B, 78, N3)
+path([P("C1", "2"), (P("C1", "2")[0], 82)], NG)
+via(X_GND, 82, NG)
+for ref, y in (("C2", 76), ("C3", 79)):
+    place_fp(ref, X_CHAN, y)
+    path([P(ref, "1"), (X_V12, y)], N12)
+    via(X_V12, y, N12)
+    path([P(ref, "2"), (P(ref, "2")[0], 82)], NG)
 
 # Контур платы и надписи.
 x0, y0, x1, y1 = BOARD
 for a, b, c, d in ((x0, y0, x1, y0), (x1, y0, x1, y1), (x1, y1, x0, y1), (x0, y1, x0, y0)):
     edge(a, b, c, d)
-note("NRI G-13 <-> RP2350-Plus", 30, 8, 2.0)
-note("R11..R16 - только если приёмник не тянет линии сам", 30, 96, 1.2)
-
+note("NRI G-13 <-> RP2350-Plus", 22, 9, 1.8)
+note("R11..R16 - только если приёмник не тянет линии сам", 22, 84, 1.1)
 
 # --- Запись ---------------------------------------------------------------
 
