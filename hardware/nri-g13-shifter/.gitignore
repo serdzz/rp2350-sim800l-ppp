@@ -1,0 +1,6 @@
+# Промежуточное: пересоздаётся из gen_sch.py и kicad-cli.
+*.svg
+*-erc.rpt
+net.txt
+*-backups/
+fp-info-cache
