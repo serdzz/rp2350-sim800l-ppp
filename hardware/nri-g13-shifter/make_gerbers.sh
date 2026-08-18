@@ -22,6 +22,19 @@ kicad-cli pcb export drill \
     --generate-report --report-path "$OUT/drill-report.txt" \
     -o "$OUT/" "$BOARD.kicad_pcb"
 
+# Комплект для монтажа: перечень элементов и координаты установки.
+# --exclude-dnp обязателен: R11..R16 ставить не нужно, и завод не должен
+# узнать об этом из примечания в письме.
+mkdir -p assembly
+kicad-cli sch export bom \
+    --fields 'Value,Reference,Footprint,${QUANTITY}' \
+    --labels 'Comment,Designator,Footprint,Qty' \
+    --group-by 'Value,Footprint' --exclude-dnp \
+    -o assembly/bom.csv "$BOARD.kicad_sch"
+
+kicad-cli pcb export pos --format csv --units mm --side both --exclude-dnp \
+    -o assembly/cpl.csv "$BOARD.kicad_pcb"
+
 rm -f "$BOARD-gerber.zip"
 (cd "$OUT" && zip -q "../$BOARD-gerber.zip" *.gbr *.gbrjob *.drl)
 

@@ -1,5 +1,5 @@
 Drill report for nri-g13-shifter.kicad_pcb
-Created on 2026-08-18T18:52:33
+Created on 2026-08-18T19:02:33
 
 Copper Layer Stackup:
     =============================================================
