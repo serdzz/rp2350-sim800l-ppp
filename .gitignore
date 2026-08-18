@@ -4,3 +4,6 @@ Cargo.lock.orig
 *.uf2
 .DS_Store
 /backup
+
+# Локальные настройки вида KiCad, если проект открыли из корня.
+nri-g13-shifter.kicad_prl
