@@ -12,3 +12,5 @@ fp-info-cache
 # Служебное окружения.
 __pycache__/
 .history/
+pcb.svg
+*-drc.rpt
