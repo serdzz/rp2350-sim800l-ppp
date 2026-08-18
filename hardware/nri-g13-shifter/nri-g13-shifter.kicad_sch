@@ -3437,7 +3437,7 @@
 			(at 134.62 180.34 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
-		(property "LCSC" "C72043"
+		(property "LCSC" "C2286"
 			(at 134.62 180.34 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
@@ -3479,7 +3479,7 @@
 			(at 151.13000000000002 168.91 0)
 			(effects (font (size 1.27 1.27)) (justify left))
 		)
-		(property "Value" "1k"
+		(property "Value" "470"
 			(at 151.13000000000002 171.45 0)
 			(effects (font (size 1.27 1.27)) (justify left))
 		)
@@ -3491,7 +3491,7 @@
 			(at 146.05 170.18 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
-		(property "LCSC" "C21190"
+		(property "LCSC" "C23179"
 			(at 146.05 170.18 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
@@ -3866,7 +3866,7 @@
 			(at 167.64 180.34 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
-		(property "LCSC" "C72043"
+		(property "LCSC" "C2286"
 			(at 167.64 180.34 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
@@ -3908,7 +3908,7 @@
 			(at 184.15 168.91 0)
 			(effects (font (size 1.27 1.27)) (justify left))
 		)
-		(property "Value" "1k"
+		(property "Value" "470"
 			(at 184.15 171.45 0)
 			(effects (font (size 1.27 1.27)) (justify left))
 		)
@@ -3920,7 +3920,7 @@
 			(at 179.07 170.18 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
-		(property "LCSC" "C21190"
+		(property "LCSC" "C23179"
 			(at 179.07 170.18 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
@@ -4295,7 +4295,7 @@
 			(at 200.66 180.34 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
-		(property "LCSC" "C72043"
+		(property "LCSC" "C2286"
 			(at 200.66 180.34 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
@@ -4337,7 +4337,7 @@
 			(at 217.17000000000002 168.91 0)
 			(effects (font (size 1.27 1.27)) (justify left))
 		)
-		(property "Value" "1k"
+		(property "Value" "470"
 			(at 217.17000000000002 171.45 0)
 			(effects (font (size 1.27 1.27)) (justify left))
 		)
@@ -4349,7 +4349,7 @@
 			(at 212.09 170.18 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
-		(property "LCSC" "C21190"
+		(property "LCSC" "C23179"
 			(at 212.09 170.18 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
@@ -4724,7 +4724,7 @@
 			(at 233.68 180.34 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
-		(property "LCSC" "C72043"
+		(property "LCSC" "C2286"
 			(at 233.68 180.34 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
@@ -4766,7 +4766,7 @@
 			(at 250.19000000000003 168.91 0)
 			(effects (font (size 1.27 1.27)) (justify left))
 		)
-		(property "Value" "1k"
+		(property "Value" "470"
 			(at 250.19000000000003 171.45 0)
 			(effects (font (size 1.27 1.27)) (justify left))
 		)
@@ -4778,7 +4778,7 @@
 			(at 245.11 170.18 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
-		(property "LCSC" "C21190"
+		(property "LCSC" "C23179"
 			(at 245.11 170.18 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
@@ -5153,7 +5153,7 @@
 			(at 266.70000000000005 180.34 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
-		(property "LCSC" "C72043"
+		(property "LCSC" "C2286"
 			(at 266.70000000000005 180.34 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
@@ -5195,7 +5195,7 @@
 			(at 283.21000000000004 168.91 0)
 			(effects (font (size 1.27 1.27)) (justify left))
 		)
-		(property "Value" "1k"
+		(property "Value" "470"
 			(at 283.21000000000004 171.45 0)
 			(effects (font (size 1.27 1.27)) (justify left))
 		)
@@ -5207,7 +5207,7 @@
 			(at 278.13000000000005 170.18 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
-		(property "LCSC" "C21190"
+		(property "LCSC" "C23179"
 			(at 278.13000000000005 170.18 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
@@ -5582,7 +5582,7 @@
 			(at 299.72 180.34 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
-		(property "LCSC" "C72043"
+		(property "LCSC" "C2286"
 			(at 299.72 180.34 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
@@ -5624,7 +5624,7 @@
 			(at 316.23 168.91 0)
 			(effects (font (size 1.27 1.27)) (justify left))
 		)
-		(property "Value" "1k"
+		(property "Value" "470"
 			(at 316.23 171.45 0)
 			(effects (font (size 1.27 1.27)) (justify left))
 		)
@@ -5636,7 +5636,7 @@
 			(at 311.15000000000003 170.18 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
-		(property "LCSC" "C21190"
+		(property "LCSC" "C23179"
 			(at 311.15000000000003 170.18 0)
 			(effects (font (size 1.27 1.27)) (hide yes))
 		)
