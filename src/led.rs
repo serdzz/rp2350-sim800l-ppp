@@ -62,6 +62,32 @@ pub fn mode() -> Mode {
     Mode::from_code(MODE.load(Ordering::Relaxed))
 }
 
+/// Переключить: горит или мигает — погасить, погашен — зажечь.
+///
+/// Возвращает новый режим, чтобы вызывающему не пришлось читать атомик
+/// повторно и получить чужое значение.
+///
+/// Смена делается одним действием, а не чтением с последующей записью: команды
+/// приходят из MQTT, и две подряд не должны схлопнуться в одну. `Blink`
+/// считается включённым состоянием — гасить мигающий светодиод логичнее, чем
+/// объявлять его выключенным.
+pub fn toggle() -> Mode {
+    let previous = MODE
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |code| {
+            Some(match Mode::from_code(code) {
+                Mode::Off => Mode::On,
+                _ => Mode::Off,
+            }
+            .code())
+        })
+        .unwrap_or(Mode::Off.code());
+
+    match Mode::from_code(previous) {
+        Mode::Off => Mode::On,
+        _ => Mode::Off,
+    }
+}
+
 /// Исполняет текущий режим.
 #[embassy_executor::task]
 pub async fn led_task(mut led: Output<'static>) -> ! {

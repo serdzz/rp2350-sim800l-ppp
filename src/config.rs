@@ -197,7 +197,10 @@ pub const MQTT_TOPIC_COIN_BLOCK: &str = "rp2350-sim800l/coin/block";
 
 /// Топик для принятых SMS (публикуем).
 pub const MQTT_TOPIC_SMS: &str = "rp2350-sim800l/sms";
-/// Топик управления светодиодом (подписываемся). Тело: `ON`, `OFF` или `BLINK`.
+/// Топик управления светодиодом (подписываемся).
+///
+/// Тело: `ON`, `OFF`, `BLINK` или `TOGGLE`. Первые три задают состояние,
+/// последняя зависит от текущего — см. [`crate::led::toggle`].
 pub const MQTT_TOPIC_LED: &str = "rp2350-sim800l/led";
 /// Как часто публиковать CSQ.
 pub const MQTT_PUBLISH_SECS: u64 = 60;

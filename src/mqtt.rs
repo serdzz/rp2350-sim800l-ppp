@@ -2,7 +2,7 @@
 //!
 //! Раз в [`config::MQTT_PUBLISH_SECS`] публикуется уровень сигнала в
 //! [`config::MQTT_TOPIC_CSQ`]. Зелёный светодиод управляется извне: команда
-//! `ON`, `OFF` или `BLINK` в [`config::MQTT_TOPIC_LED`].
+//! `ON`, `OFF`, `BLINK` или `TOGGLE` в [`config::MQTT_TOPIC_LED`].
 //!
 //! Сам светодиод живёт в [`crate::led`] — здесь только разбор команды. Режим
 //! задаётся исключительно командами и переживает переподключение к брокеру:
@@ -302,10 +302,14 @@ fn dispatch<const N: usize>(publication: &Publish<'_, N>) {
     }
 }
 
-/// Разобрать команду светодиода: `ON`, `OFF` или `BLINK`.
+/// Разобрать команду светодиода: `ON`, `OFF`, `BLINK` или `TOGGLE`.
 ///
 /// Регистр и обрамляющие пробелы игнорируются — клиенты и брокеры шлют
 /// по-разному, и договориться об этом дешевле один раз здесь.
+///
+/// `TOGGLE` стоит особняком: остальные команды задают состояние, а эта зависит
+/// от текущего, поэтому и смена делается в [`led::toggle`] одним действием.
+/// Иначе две команды, пришедшие подряд, могли бы схлопнуться в одну.
 fn apply_led_command(payload: &[u8]) {
     let trimmed = payload.trim_ascii();
 
@@ -315,9 +319,13 @@ fn apply_led_command(payload: &[u8]) {
         led::Mode::Off
     } else if trimmed.eq_ignore_ascii_case(b"BLINK") {
         led::Mode::Blink
+    } else if trimmed.eq_ignore_ascii_case(b"TOGGLE") {
+        let mode = led::toggle();
+        info!("MQTT: светодиод -> {:?} (переключение)", mode);
+        return;
     } else {
         warn!(
-            "MQTT: непонятная команда светодиода ({} байт), ожидается ON, OFF или BLINK",
+            "MQTT: непонятная команда светодиода ({} байт), ожидается ON, OFF, BLINK или TOGGLE",
             trimmed.len()
         );
         return;

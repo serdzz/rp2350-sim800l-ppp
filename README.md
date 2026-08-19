@@ -265,7 +265,7 @@ COIN: EUR 1 (линия 5) (код 0b010000), номинал 100, кредит 1
 | `rp2350-sim800l/csq` | публикуем, retain | `<rssi>` из `+CSQ`, раз в 60 с |
 | `rp2350-sim800l/sms` | публикуем, retain | текст принятого SMS |
 | `rp2350-sim800l/coin` | публикуем | `{"coin":"EUR 1","code":5,"value":100,"credit":100}` |
-| `rp2350-sim800l/led` | подписаны | `ON`, `OFF`, `BLINK` |
+| `rp2350-sim800l/led` | подписаны | `ON`, `OFF`, `BLINK`, `TOGGLE` |
 | `rp2350-sim800l/coin/block` | подписаны | `none`, `all`, `1,3` — какие линии заблокировать |
 | `rp2350-sim800l/coin/total` | подписаны | `block` / `accept` — закрыть приём целиком |
 
