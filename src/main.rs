@@ -755,7 +755,12 @@ async fn multiplexed_session(
                     // Отправка идёт здесь, а не в MQTT-задаче: она требует
                     // модема и занимает секунды, а канал держит эта ветка.
                     Either3::Third(sms) => {
-                        let _ = sim800l::send_sms(&mut client, &sms.number, &sms.text).await;
+                        // Ошибку печатаем здесь: без этого неудачная отправка
+                        // выглядела бы как её полное отсутствие.
+                        if let Err(e) = sim800l::send_sms(&mut client, &sms.number, &sms.text).await
+                        {
+                            warn!("SMS: отправка не удалась: {:?}", e);
+                        }
                     }
                 }
             }

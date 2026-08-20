@@ -40,9 +40,10 @@
 //! `rust-mqtt` намеренно не управляет соединением: ни переподключений, ни
 //! keepalive-цикла в нём нет. Всё это здесь, во внешнем цикле.
 //!
-//! Клиент обязан регулярно вызывать `poll()` — иначе протокол не движется и
-//! брокер разорвёт соединение по keepalive. Поэтому публикация и опрос сидят
-//! в одном `select`.
+//! Клиент обязан регулярно вызывать `poll()` — иначе протокол не движется.
+//! Поддержание соединения тоже на нас: `ping()` в `rust-mqtt` не автоматика,
+//! а обычный метод, который надо звать по таймеру. Поэтому публикация, ping и
+//! опрос сидят в одном `select`.
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
@@ -115,9 +116,19 @@ const MQTT_BUFFER: usize = 1024;
 /// Пауза перед повторной попыткой после обрыва.
 const RETRY_DELAY: Duration = Duration::from_secs(10);
 
-/// Keepalive. Брокер разорвёт соединение, если мы столько молчим; `poll()`
-/// в цикле шлёт PINGREQ сам.
-const KEEP_ALIVE_SECS: u16 = 120;
+/// Keepalive, о котором мы договариваемся с брокером.
+const KEEP_ALIVE_SECS: u16 = 60;
+
+/// Как часто слать PINGREQ.
+///
+/// `rust-mqtt` сам этого не делает: `ping()` там — обычный метод, который
+/// обязан звать пользователь. Интервал вдвое короче keepalive, чтобы одна
+/// потерянная посылка не роняла сессию, и заведомо короче [`SOCKET_TIMEOUT`],
+/// чтобы канал не простаивал.
+const PING_INTERVAL: Duration = Duration::from_secs(20);
+
+/// Через сколько тишины считать сокет мёртвым.
+const SOCKET_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Публикация телеметрии и индикация связи светодиодом.
 #[embassy_executor::task]
@@ -156,8 +167,11 @@ async fn session(
         .ok_or_else(|| warn!("MQTT: пустой DNS-ответ"))?;
 
     let mut socket = TcpSocket::new(stack, rx_buffer, tx_buffer);
-    // GPRS отвечает сотнями миллисекунд; таймаут должен быть щедрым.
-    socket.set_timeout(Some(Duration::from_secs(30)));
+    // Таймаут обязан быть больше интервала между посылками, иначе сокет
+    // обрывает сам себя в тишине между ними. Именно это и происходило:
+    // тридцать секунд таймаута против шестидесяти между публикациями давали
+    // разрыв каждые полминуты.
+    socket.set_timeout(Some(SOCKET_TIMEOUT));
     socket
         .connect((addr, config::MQTT_PORT))
         .await
@@ -214,13 +228,17 @@ async fn session(
     // Дедлайн, а не пересоздаваемый таймер: событие от poll() не должно
     // сдвигать момент следующей публикации.
     let mut deadline = Instant::now();
+    let mut ping_deadline = Instant::now() + PING_INTERVAL;
 
     let sms_topic = topic_name(config::MQTT_TOPIC_SMS)?;
     let coin_topic = topic_name(config::MQTT_TOPIC_COIN)?;
 
     loop {
+        // Два срока в одной ветке: `select` больше четырёх будущих не берёт, а
+        // разносить их по отдельным веткам ради этого незачем — проще
+        // проснуться к ближайшему и посмотреть, что подошло.
         match select4(
-            Timer::at(deadline),
+            Timer::at(deadline.min(ping_deadline)),
             client.poll(),
             SMS_QUEUE.receive(),
             COIN_QUEUE.receive(),
@@ -228,6 +246,19 @@ async fn session(
         .await
         {
             Either4::First(()) => {
+                if Instant::now() >= ping_deadline {
+                    client
+                        .ping()
+                        .await
+                        .map_err(|e| warn!("MQTT: ping не ушёл: {:?}", e))?;
+                    ping_deadline = Instant::now() + PING_INTERVAL;
+                    // SAFETY: заимствований из буфера после ping нет.
+                    unsafe { client.buffer_mut().reset() };
+                }
+                if Instant::now() < deadline {
+                    continue;
+                }
+
                 let csq = LAST_CSQ.load(Ordering::Relaxed);
                 let mut payload = heapless::String::<8>::new();
                 let _ = core::fmt::Write::write_fmt(&mut payload, format_args!("{csq}"));
@@ -370,6 +401,7 @@ fn queue_sms(number: &str, payload: &[u8]) {
     // Не блокируемся: очередь переполняется только когда модем занят подъёмом
     // канала, а держать из-за этого MQTT-клиента нельзя — он отвалится по
     // keepalive.
+    info!("SMS: в очередь на +{} ({} байт)", number.as_str(), text.len());
     if SMS_SEND_QUEUE.try_send(OutgoingSms { number, text }).is_err() {
         warn!("SMS: очередь на отправку переполнена, сообщение потеряно");
     }
