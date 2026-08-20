@@ -503,3 +503,48 @@ pub async fn escape_data_mode<W: Write>(writer: &mut W) {
     let _ = writer.flush().await;
     Timer::after(Duration::from_millis(500)).await;
 }
+
+/// Отправить SMS.
+///
+/// Единственная команда, идущая в два приёма: сначала номер, потом, по
+/// приглашению `> `, текст с Ctrl-Z. Между ними модем ничего другого не
+/// принимает, поэтому вклиниться сюда с опросом CSQ нельзя — вызывающий
+/// обязан держать канал.
+///
+/// Проверки номера и текста делаются до первой команды намеренно: если
+/// оборвать отправку на полпути, модем останется ждать текст, и следующая
+/// команда уедет ему в тело сообщения.
+pub async fn send_sms<A: AtatClient>(
+    client: &mut A,
+    number: &str,
+    text: &str,
+) -> Result<(), BringUpError> {
+    if !valid_phone(number) {
+        warn!("SMS: номер не годится, ожидаются только цифры");
+        return Err(BringUpError::SimNotReady);
+    }
+    if !sms_text_is_sendable(text) {
+        warn!(
+            "SMS: текст не отправить ({} байт): нужен ASCII не длиннее {}",
+            text.len(),
+            SMS_MAX_LEN
+        );
+        return Err(BringUpError::SimNotReady);
+    }
+
+    // Плюс подставляем здесь: в имени топика MQTT он запрещён, поэтому номер
+    // всюду ходит цифрами.
+    let mut international = heapless::String::<24>::new();
+    let _ = core::fmt::Write::write_char(&mut international, '+');
+    let _ = core::fmt::Write::write_str(&mut international, number);
+
+    client
+        .send(&SendSmsHeader {
+            number: international.as_str(),
+        })
+        .await?;
+    let reply = client.send(&SmsBody { text }).await?;
+
+    info!("SMS: отправлено на +{} — {}", number, reply.text.as_str());
+    Ok(())
+}

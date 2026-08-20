@@ -4,6 +4,9 @@
 //! [`config::MQTT_TOPIC_CSQ`]. Зелёный светодиод управляется извне: команда
 //! `ON`, `OFF`, `BLINK` или `TOGGLE` в [`config::MQTT_TOPIC_LED`].
 //!
+//! Отправка SMS: номер последним сегментом топика
+//! [`config::MQTT_TOPIC_SMS_SEND`], текст телом сообщения.
+//!
 //! Сам светодиод живёт в [`crate::led`] — здесь только разбор команды. Режим
 //! задаётся исключительно командами и переживает переподключение к брокеру:
 //! гасить светодиод при обрыве значило бы врать о состоянии, которое никто
@@ -62,6 +65,7 @@ use rust_mqtt::types::{MqttString, TopicName};
 use crate::coin_io;
 use crate::config;
 use crate::led;
+use crate::modem;
 
 /// Принятое SMS, ожидающее публикации.
 pub type SmsText = heapless::String<384>;
@@ -82,6 +86,19 @@ pub type CoinText = heapless::String<64>;
 /// Отдельная от SMS: монеты идут чаще и терять их обиднее, а смешивать
 /// очереди значило бы, что одно длинное SMS задержит выдачу сдачи.
 pub static COIN_QUEUE: Channel<CriticalSectionRawMutex, CoinText, 8> = Channel::new();
+
+/// SMS, которое нужно отправить: номер цифрами и текст.
+pub struct OutgoingSms {
+    pub number: heapless::String<24>,
+    pub text: heapless::String<{ modem::SMS_MAX_LEN }>,
+}
+
+/// Очередь на отправку — от брокера к тому, кто держит AT-канал.
+///
+/// Зеркало [`SMS_QUEUE`], только в обратную сторону. Отправка занимает
+/// секунды и требует модема, поэтому делать её прямо в разборе публикации
+/// нельзя: MQTT-клиент за это время потеряет соединение по keepalive.
+pub static SMS_SEND_QUEUE: Channel<CriticalSectionRawMutex, OutgoingSms, 4> = Channel::new();
 
 /// Держится ли сейчас соединение с брокером. Читает экран.
 pub static CONNECTED: AtomicBool = AtomicBool::new(false);
@@ -149,10 +166,10 @@ async fn session(
 
     let mut buffer = BumpBuffer::new(storage);
     // Первый параметр — сколько SUBSCRIBE может быть в полёте одновременно.
-    // Их три: светодиод, поканальная и полная блокировка монетоприёмника.
+    // Их четыре: светодиод, две блокировки монетоприёмника и отправка SMS.
     // `subscribe()` не ждёт SUBACK, он только отправляет пакет, поэтому с
     // запасом в единицу вторая подписка отвалилась бы с `SessionBuffer`.
-    let mut client = Client::<'_, _, _, 3, 1, 1, 1>::new(&mut buffer);
+    let mut client = Client::<'_, _, _, 4, 1, 1, 1>::new(&mut buffer);
 
     let client_id = MqttString::try_from(config::MQTT_CLIENT_ID)
         .map_err(|_| warn!("MQTT: слишком длинный client id"))?;
@@ -180,6 +197,7 @@ async fn session(
         config::MQTT_TOPIC_LED,
         config::MQTT_TOPIC_COIN_BLOCK,
         config::MQTT_TOPIC_COIN_TOTAL,
+        config::MQTT_TOPIC_SMS_SEND_FILTER,
     ] {
         let filter = topic_name(name)?;
         client
@@ -298,7 +316,49 @@ fn dispatch<const N: usize>(publication: &Publish<'_, N>) {
         config::MQTT_TOPIC_LED => apply_led_command(&publication.message),
         config::MQTT_TOPIC_COIN_BLOCK => coin_io::apply_block_command(&publication.message),
         config::MQTT_TOPIC_COIN_TOTAL => coin_io::apply_total_command(&publication.message),
+        other if other.starts_with(config::MQTT_TOPIC_SMS_SEND) => {
+            queue_sms(&other[config::MQTT_TOPIC_SMS_SEND.len()..], &publication.message)
+        }
         other => warn!("MQTT: публикация в неожиданном топике {}", other),
+    }
+}
+
+/// Поставить SMS в очередь на отправку.
+///
+/// Номер приходит последним сегментом топика, текст — телом. Проверяем оба
+/// здесь, чтобы отказ был виден в логе рядом с командой, а не через минуту в
+/// глубине AT-канала.
+fn queue_sms(number: &str, payload: &[u8]) {
+    let Ok(text) = core::str::from_utf8(payload) else {
+        warn!("SMS: текст не в UTF-8");
+        return;
+    };
+    if !modem::valid_phone(number) {
+        warn!("SMS: номер в топике не годится, ожидаются только цифры без плюса");
+        return;
+    }
+    if !modem::sms_text_is_sendable(text) {
+        warn!(
+            "SMS: текст не отправить ({} байт): нужен ASCII не длиннее {}",
+            text.len(),
+            modem::SMS_MAX_LEN
+        );
+        return;
+    }
+
+    let (Ok(number), Ok(text)) = (
+        heapless::String::try_from(number),
+        heapless::String::try_from(text),
+    ) else {
+        warn!("SMS: не поместилось в буфер");
+        return;
+    };
+
+    // Не блокируемся: очередь переполняется только когда модем занят подъёмом
+    // канала, а держать из-за этого MQTT-клиента нельзя — он отвалится по
+    // keepalive.
+    if SMS_SEND_QUEUE.try_send(OutgoingSms { number, text }).is_err() {
+        warn!("SMS: очередь на отправку переполнена, сообщение потеряно");
     }
 }
 

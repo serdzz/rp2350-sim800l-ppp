@@ -301,10 +301,15 @@ async fn main(spawner: Spawner) {
     static INGRESS_BUF: StaticCell<[u8; INGRESS_BUF_SIZE]> = StaticCell::new();
     static CMD_BUF: StaticCell<[u8; CMD_BUF_SIZE]> = StaticCell::new();
 
-    // with_custom_success: SIM800L отвечает на AT+CIPSHUT строкой `SHUT OK`,
-    // которую штатный дайджестер не считает успехом — см. modem::parse_shut_ok.
+    // Две надстройки над штатным дайджестером, обе — под особенности SIM800L:
+    //
+    // * `SHUT OK` в ответ на AT+CIPSHUT успехом не считается;
+    // * приглашение `> ` при отправке SMS не заканчивается переводом строки и
+    //   на ответ не похоже вовсе.
     let ingress = Ingress::new(
-        DefaultDigester::<Urc>::new().with_custom_success(modem::parse_shut_ok),
+        DefaultDigester::<Urc>::new()
+            .with_custom_success(modem::parse_shut_ok)
+            .with_custom_prompt(modem::parse_sms_prompt),
         INGRESS_BUF.init([0; INGRESS_BUF_SIZE]),
         &RES_SLOT,
         &URC_CHANNEL,
@@ -715,8 +720,14 @@ async fn multiplexed_session(
         let at_fut = async {
             let mut csq_deadline = Instant::now() + Duration::from_secs(30);
             loop {
-                match select(Timer::at(csq_deadline), sms_urc.next_message_pure()).await {
-                    Either::First(()) => {
+                match select3(
+                    Timer::at(csq_deadline),
+                    sms_urc.next_message_pure(),
+                    mqtt::SMS_SEND_QUEUE.receive(),
+                )
+                .await
+                {
+                    Either3::First(()) => {
                         match client.send(&modem::GetSignalQuality).await {
                             Ok(csq) => {
                                 info!("CMUX: CSQ {} при поднятом PPP", csq.rssi);
@@ -728,10 +739,15 @@ async fn multiplexed_session(
                         read_network_time(&mut client).await;
                         csq_deadline = Instant::now() + Duration::from_secs(30);
                     }
-                    Either::Second(Urc::NewMessage(notice)) => {
+                    Either3::Second(Urc::NewMessage(notice)) => {
                         forward_sms(&mut client, notice.index).await;
                     }
-                    Either::Second(_) => {}
+                    Either3::Second(_) => {}
+                    // Отправка идёт здесь, а не в MQTT-задаче: она требует
+                    // модема и занимает секунды, а канал держит эта ветка.
+                    Either3::Third(sms) => {
+                        let _ = sim800l::send_sms(&mut client, &sms.number, &sms.text).await;
+                    }
                 }
             }
         };

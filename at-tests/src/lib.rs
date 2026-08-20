@@ -197,6 +197,78 @@ mod tests {
         assert!(r.text.as_str().ends_with("Hello"));
     }
 
+    /// Отправка идёт в два приёма, и на проводе это должно выглядеть ровно
+    /// так: команда с номером в кавычках, потом голый текст с Ctrl-Z и без
+    /// возврата каретки.
+    #[test]
+    fn sms_send_is_two_stage() {
+        assert_eq!(
+            ser(&SendSmsHeader {
+                number: "+37120000000"
+            }),
+            "AT+CMGS=\"+37120000000\"\r"
+        );
+
+        let mut buf = vec![0u8; 256];
+        let n = SmsBody { text: "Hello" }.write(&mut buf);
+        assert_eq!(&buf[..n], b"Hello\x1a", "ни AT, ни \\r — только текст и Ctrl-Z");
+
+        // Ответ на текст — номер отправленного сообщения.
+        let r = SmsBody { text: "Hello" }.parse(Ok(b"+CMGS: 42")).unwrap();
+        assert_eq!(r.text.as_str(), "+CMGS: 42");
+    }
+
+    /// Приглашение `> ` не заканчивается переводом строки, и штатный
+    /// дайджестер его не узнаёт. Без своего разборщика отправка встала бы на
+    /// первой же половине.
+    #[test]
+    fn prompt_is_recognised() {
+        let mut d = atat::DefaultDigester::<Urc>::new().with_custom_prompt(parse_sms_prompt);
+
+        let (res, used) = d.digest(b"\r\n> ");
+        assert!(matches!(res, DigestResult::Prompt(b'>')), "{:?}", res);
+        assert_eq!(used, 4);
+
+        // Приглашение без предваряющего перевода строки тоже встречается.
+        let (res, _) = d.digest(b"> ");
+        assert!(matches!(res, DigestResult::Prompt(b'>')), "{:?}", res);
+
+        // Обычные ответы не сломались.
+        let (res, _) = d.digest(b"\r\n+CMGS: 42\r\n\r\nOK\r\n");
+        match res {
+            DigestResult::Response(Ok(body)) => assert_eq!(body, b"+CMGS: 42"),
+            other => panic!("{:?}", other),
+        }
+    }
+
+    /// Номер ходит цифрами: в имени топика MQTT плюс запрещён, это
+    /// подстановочный знак.
+    #[test]
+    fn phone_numbers_are_digits_only() {
+        assert!(valid_phone("37120000000"));
+        assert!(valid_phone("12345"));
+        for bad in ["+37120000000", "371 2000", "1234", "", "371-20000000", "abcde"] {
+            assert!(!valid_phone(bad), "принят: {bad}");
+        }
+        // Двадцать знаков — предел, двадцать один уже нет.
+        assert!(valid_phone(&"1".repeat(20)));
+        assert!(!valid_phone(&"1".repeat(21)));
+    }
+
+    /// Кириллица требует UCS2 и перекодировки всего сообщения. Отправить её
+    /// как есть — значит получить абракадабру, поэтому отказываемся честно.
+    #[test]
+    fn only_plain_ascii_is_sendable() {
+        assert!(sms_text_is_sendable("Coin jam on line 3"));
+        assert!(sms_text_is_sendable(&"x".repeat(160)));
+
+        assert!(!sms_text_is_sendable(""), "пустое отправлять незачем");
+        assert!(!sms_text_is_sendable(&"x".repeat(161)), "не влезает в одно");
+        assert!(!sms_text_is_sendable("Замятие монеты"), "кириллица");
+        assert!(!sms_text_is_sendable("текст\u{1a}хвост"), "Ctrl-Z оборвёт");
+        assert!(!sms_text_is_sendable("a\u{1b}b"), "Esc отменит отправку");
+    }
+
     /// `+CMTI` не должен затенять ответы на наши команды.
     #[test]
     fn cmti_does_not_shadow_cmgr() {

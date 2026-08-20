@@ -439,3 +439,103 @@ pub enum Urc {
     #[at_urc(b"+CMTI")]
     NewMessage(NewMessageIndex),
 }
+
+// --- Отправка SMS ---------------------------------------------------------
+//
+// Отправка — единственная команда во всём наборе, идущая в два приёма.
+// Сначала `AT+CMGS="номер"`, модем отвечает приглашением `> `, и только потом
+// уходит текст, завершённый Ctrl-Z. Между приглашением и текстом модем ждёт и
+// ничего больше не принимает.
+
+/// Максимальная длина текста SMS в одном сообщении.
+///
+/// 160 символов семибитного алфавита GSM. Длиннее — это уже составное
+/// сообщение с заголовком UDH, которого текстовый режим не умеет.
+pub const SMS_MAX_LEN: usize = 160;
+
+/// Приглашение к вводу текста.
+///
+/// Штатный дайджестер про него не знает: `> ` не заканчивается переводом
+/// строки и на обычный ответ не похож. Ставится через
+/// `DefaultDigester::with_custom_prompt`, как `SHUT OK` — через
+/// `with_custom_success`.
+pub fn parse_sms_prompt(buf: &[u8]) -> Result<(u8, usize), atat::digest::ParseError> {
+    let trimmed = buf.strip_prefix(b"\r\n").unwrap_or(buf);
+    if trimmed.starts_with(b"> ") {
+        Ok((b'>', buf.len() - trimmed.len() + 2))
+    } else if b"> ".starts_with(trimmed) && !trimmed.is_empty() {
+        Err(atat::digest::ParseError::Incomplete)
+    } else {
+        Err(atat::digest::ParseError::NoMatch)
+    }
+}
+
+/// Годится ли номер для отправки.
+///
+/// Только цифры, от 5 до 20 знаков. Ведущий `+` не принимается намеренно: в
+/// имени топика MQTT он запрещён — это подстановочный знак, — поэтому номер
+/// всюду ходит цифрами, а плюс подставляется перед отправкой.
+pub fn valid_phone(number: &str) -> bool {
+    (5..=20).contains(&number.len()) && number.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Пригоден ли текст к отправке в семибитном алфавите GSM.
+///
+/// Кириллица требует `AT+CSCS="UCS2"` и перекодировки всего, включая номер, —
+/// это отдельная работа, и делать её молча, отправляя абракадабру, хуже, чем
+/// честно отказаться.
+pub fn sms_text_is_sendable(text: &str) -> bool {
+    !text.is_empty()
+        && text.len() <= SMS_MAX_LEN
+        && text
+            .bytes()
+            .all(|b| b.is_ascii() && b != CTRL_Z && b != ESC)
+}
+
+/// Завершает текст сообщения и запускает отправку.
+const CTRL_Z: u8 = 0x1A;
+/// Отменяет ввод. В тексте недопустим — иначе сообщение молча не уйдёт.
+const ESC: u8 = 0x1B;
+
+/// `AT+CMGS="<номер>"` — первая половина отправки.
+///
+/// Ответом служит приглашение `> `, а не `OK`: `Response::Prompt` доезжает до
+/// клиента как успех с пустым телом, поэтому тип ответа здесь `NoResponse`.
+#[derive(Clone, AtatCmd)]
+#[at_cmd("+CMGS", NoResponse, timeout_ms = 10_000)]
+pub struct SendSmsHeader<'a> {
+    #[at_arg(position = 0, len = 24)]
+    pub number: &'a str,
+}
+
+/// Текст сообщения с завершающим Ctrl-Z — вторая половина отправки.
+///
+/// Написана вручную, а не выведена макросом: у неё нет ни префикса `AT`, ни
+/// завершающего возврата каретки, ни разделителя `=`. Всё, что выводит
+/// макрос, здесь помешало бы.
+#[derive(Clone)]
+pub struct SmsBody<'a> {
+    pub text: &'a str,
+}
+
+impl atat::AtatCmd for SmsBody<'_> {
+    type Response = RawLine;
+
+    const MAX_LEN: usize = SMS_MAX_LEN + 1;
+
+    /// Отправка по сети занимает секунды, а на слабом сигнале — десятки.
+    const MAX_TIMEOUT_MS: u32 = 60_000;
+
+    fn write(&self, buf: &mut [u8]) -> usize {
+        let text = self.text.as_bytes();
+        let len = text.len().min(SMS_MAX_LEN);
+        buf[..len].copy_from_slice(&text[..len]);
+        buf[len] = CTRL_Z;
+        len + 1
+    }
+
+    fn parse(&self, resp: Result<&[u8], atat::InternalError>) -> Result<RawLine, atat::Error> {
+        let resp = resp.map_err(atat::Error::from)?;
+        parse_raw_line(resp).map_err(|_| atat::Error::Parse)
+    }
+}
