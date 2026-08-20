@@ -704,11 +704,6 @@ async fn multiplexed_session(
 
         let mut client = Client::new(Compat(at_tx), &RES_SLOT, cmd_buf, atat::Config::new());
 
-        // Настройки SMS задаём именно здесь, на AT-канале: в мультиплексном
-        // режиме каждый DLCI — свой AT-интерфейс, и заданное до AT+CMUX сюда
-        // не переносится.
-        sim800l::configure_sms(&mut client).await;
-
         let ingress_fut = async {
             ingress.read_from(Compat(at_rx)).await;
         };
@@ -718,6 +713,20 @@ async fn multiplexed_session(
         // мультиплексора, там модем занят PPP.
         let mut sms_urc: UrcSub = unwrap!(URC_CHANNEL.subscribe().ok());
         let at_fut = async {
+            // Настройки SMS задаём здесь, а не выше по тексту, по двум
+            // причинам сразу.
+            //
+            // На AT-канале — потому что в мультиплексном режиме каждый DLCI
+            // это свой AT-интерфейс, и заданное до `AT+CMUX` сюда не
+            // переносится.
+            //
+            // И внутри этой ветки — потому что ответы модема разбирает
+            // `ingress_fut`, а он запускается тем же `select3`, что и мы.
+            // Команда, отправленная раньше, ушла бы в никуда: отвечать модем
+            // ответит, но прочитать ответ будет некому, и всё упрётся в
+            // таймаут.
+            sim800l::configure_sms(&mut client).await;
+
             let mut csq_deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 match select3(

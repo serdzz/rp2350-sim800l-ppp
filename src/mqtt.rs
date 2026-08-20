@@ -60,7 +60,7 @@ use rust_mqtt::client::options::{
     ConnectOptions, PublicationOptions, SubscriptionOptions, TopicReference,
 };
 use rust_mqtt::config::{KeepAlive, SessionExpiryInterval};
-use rust_mqtt::types::{MqttString, TopicName};
+use rust_mqtt::types::{MqttString, TopicFilter, TopicName};
 
 use crate::coin_io;
 use crate::config;
@@ -199,9 +199,9 @@ async fn session(
         config::MQTT_TOPIC_COIN_TOTAL,
         config::MQTT_TOPIC_SMS_SEND_FILTER,
     ] {
-        let filter = topic_name(name)?;
+        let filter = topic_filter(name)?;
         client
-            .subscribe(filter.as_borrowed().into(), SubscriptionOptions::new())
+            .subscribe(filter.as_borrowed(), SubscriptionOptions::new())
             .await
             .map_err(|e| warn!("MQTT: подписка на {} не удалась: {:?}", name, e))?;
         info!("MQTT: подписаны на {}", name);
@@ -302,6 +302,19 @@ fn topic_name(name: &str) -> Result<TopicName<'_>, ()> {
         MqttString::try_from(name).map_err(|_| warn!("MQTT: слишком длинный топик {}", name))?,
     )
     .ok_or_else(|| warn!("MQTT: недопустимый топик {}", name))
+}
+
+/// Собрать фильтр подписки.
+///
+/// Отдельно от [`topic_name`], и это не педантизм: имя топика и фильтр —
+/// разные типы с разными правилами. В имени подстановочные знаки запрещены,
+/// поэтому `TopicName` отвергает `sms/send/+`, а без фильтра на этот топик не
+/// подписаться вовсе.
+fn topic_filter(name: &str) -> Result<TopicFilter<'_>, ()> {
+    TopicFilter::new(
+        MqttString::try_from(name).map_err(|_| warn!("MQTT: слишком длинный фильтр {}", name))?,
+    )
+    .ok_or_else(|| warn!("MQTT: недопустимый фильтр подписки {}", name))
 }
 
 /// Разослать входящую публикацию по её топику.
