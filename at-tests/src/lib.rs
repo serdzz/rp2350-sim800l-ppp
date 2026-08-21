@@ -22,6 +22,10 @@ pub mod clock;
 #[path = "../../src/cmux.rs"]
 pub mod cmux;
 
+/// Счётчики отказов связи — тесты внутри модуля.
+#[path = "../../src/health.rs"]
+pub mod health;
+
 /// Учёт монет и разбор команд блокировки — тесты внутри модуля.
 #[path = "../../src/coin.rs"]
 pub mod coin;

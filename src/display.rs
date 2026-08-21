@@ -15,9 +15,14 @@
 //! │ 12:34               ▁▃▅▇█    │  время крупно, шкала сигнала справа
 //! │ 2026-08-16                   │
 //! │ Кредит 1.50                  │  накоплено монетоприёмником
-//! │ -73dBm  MQTT +               │
+//! │ -73dBm MQTT + 0/2            │  обрывы: MQTT / канала
 //! └──────────────────────────────┘
 //! ```
+//!
+//! Два счётчика в нижней строке — не украшение. Мгновенное состояние скрывает
+//! главное: связь, разваливающаяся каждые полминуты, выглядит здесь ровно как
+//! исправная, если посмотреть в удачную секунду. Считаются они от включения и
+//! обнуляются перезагрузкой, в том числе по сторожевому таймеру.
 //!
 //! Время приходит от сотовой сети — см. [`crate::clock`]. Пока сеть его не
 //! прислала, вместо часов выводится «--:--»: показывать заводскую дату модема
@@ -43,6 +48,7 @@ use ssd1306::{I2CDisplayInterface, Ssd1306Async};
 use crate::clock;
 use crate::coin;
 use crate::coin_io;
+use crate::health;
 use crate::mqtt;
 
 /// Адреса, на которых встречаются эти модули. `0x3C` — заводской, `0x3D`
@@ -163,18 +169,33 @@ async fn render(display: &mut Display) {
     }
     let _ = Text::new(&credit, Point::new(2, 46), small).draw(display);
 
-    // Нижняя строка сжата: уровень в дБм и состояние канала до брокера.
-    let mut status = heapless::String::<24>::new();
+    // Нижняя строка сжата: уровень в дБм, состояние канала до брокера и два
+    // счётчика обрывов — сперва MQTT, затем самого канала.
+    //
+    // Счётчики важнее, чем кажется: мгновенное состояние скрывает главное.
+    // Связь, разваливающаяся каждые полминуты, выглядит здесь ровно как
+    // исправная, если посмотреть на экран в удачную секунду.
+    let mut status = heapless::String::<32>::new();
     let dbm = clock::rssi_dbm(rssi);
     let mqtt_state = if mqtt::CONNECTED.load(core::sync::atomic::Ordering::Relaxed) {
         "MQTT +"
     } else {
         "MQTT -"
     };
+    let (mqtt_drops, link_drops) = (
+        health::short(health::mqtt_drops()),
+        health::short(health::link_drops()),
+    );
     if dbm == 0 {
-        let _ = core::fmt::Write::write_fmt(&mut status, format_args!("--dBm  {mqtt_state}"));
+        let _ = core::fmt::Write::write_fmt(
+            &mut status,
+            format_args!("--dBm {mqtt_state} {mqtt_drops}/{link_drops}"),
+        );
     } else {
-        let _ = core::fmt::Write::write_fmt(&mut status, format_args!("{dbm}dBm  {mqtt_state}"));
+        let _ = core::fmt::Write::write_fmt(
+            &mut status,
+            format_args!("{dbm}dBm {mqtt_state} {mqtt_drops}/{link_drops}"),
+        );
     }
     let _ = Text::new(&status, Point::new(2, 60), small).draw(display);
 

@@ -65,6 +65,7 @@ use rust_mqtt::types::{MqttString, TopicFilter, TopicName};
 
 use crate::coin_io;
 use crate::config;
+use crate::health;
 use crate::led;
 use crate::modem;
 
@@ -141,7 +142,14 @@ pub async fn mqtt_task(stack: Stack<'static>) -> ! {
         stack.wait_config_up().await;
 
         let outcome = session(stack, &mut rx_buffer, &mut tx_buffer, &mut storage).await;
-        CONNECTED.store(false, Ordering::Relaxed);
+
+        // Считаем потерю установленной сессии, а не неудачную попытку
+        // подключиться: `swap` возвращает прежнее значение, поэтому одно
+        // действие отвечает сразу на оба вопроса — были ли мы подключены и
+        // сбросить ли флаг.
+        if CONNECTED.swap(false, Ordering::Relaxed) {
+            warn!("MQTT: сессия потеряна, всего обрывов {}", health::mqtt_dropped());
+        }
         if let Err(()) = outcome {
             Timer::after(RETRY_DELAY).await;
         }

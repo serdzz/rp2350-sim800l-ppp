@@ -31,6 +31,7 @@ mod coin;
 mod coin_io;
 mod config;
 mod display;
+mod health;
 mod io_compat;
 mod led;
 mod lipo;
@@ -503,7 +504,11 @@ async fn run_plain(
 
         // Ok-вариант — Infallible: run() возвращается только с ошибкой.
         match result {
-            Err(e) => warn!("PPP-сессия завершена: {:?}", e),
+            Err(e) => warn!(
+                "PPP-сессия завершена: {:?}, всего обрывов {}",
+                e,
+                health::link_dropped()
+            ),
         }
 
         // Снимаем протухшую конфигурацию, чтобы wait_config_up() снова блокировал.
@@ -605,6 +610,9 @@ async fn run_multiplexed(
             ppp_config.clone(),
         )
         .await;
+
+        // Сюда попадаем только после того, как канал был поднят и развалился.
+        warn!("CMUX: канал развалился, всего обрывов {}", health::link_dropped());
 
         stack.set_config_v4(ConfigV4::None);
         // Просим модем вернуться в обычный AT-режим; если он уже там, вреда нет.
