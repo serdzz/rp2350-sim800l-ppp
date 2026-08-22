@@ -31,6 +31,7 @@ mod coin;
 mod coin_io;
 mod config;
 mod display;
+mod fuel;
 mod health;
 mod io_compat;
 mod led;
@@ -47,6 +48,7 @@ use atat::{AtatIngress, DefaultDigester, Ingress, ResponseSlot, UrcChannel, UrcS
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, Either3, select, select3};
 use embassy_net::{Config as NetConfig, ConfigV4, Ipv4Cidr, StackResources, StaticConfigV4};
+use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_rp::adc::{
     Adc, Channel as AdcChannel, Config as AdcConfig, InterruptHandler as AdcInterruptHandler,
 };
@@ -285,14 +287,23 @@ async fn main(spawner: Spawner) {
     // полярность зависит от буферного каскада, и знать о ней должен один файл.
     spawner.spawn(unwrap!(coin_io::total_block_task(p.PIN_9)));
 
-    // Экран SSD1306 на GP16 (SDA) / GP17 (SCL) — это выводы I2C0.
-    spawner.spawn(unwrap!(display::display_task(I2c::new_async(
+    // Шина I2C0 на GP16 (SDA) / GP17 (SCL): экран SSD1306 и топливомер
+    // MAX17048 висят на ней вдвоём, поэтому она за мьютексом.
+    //
+    // Мьютекс асинхронный, хотя крейт топливомера блокирующий: `embassy_rp`
+    // реализует оба трейта доступа к шине сразу, так что экран ходит через
+    // асинхронную обёртку, а топливомер берёт замок и обращается напрямую.
+    static I2C_BUS: StaticCell<fuel::I2cBus> = StaticCell::new();
+    let i2c_bus = I2C_BUS.init(Mutex::new(I2c::new_async(
         p.I2C0,
         p.PIN_17,
         p.PIN_16,
         Irqs,
         I2cConfig::default(),
-    ))));
+    )));
+
+    spawner.spawn(unwrap!(display::display_task(I2cDevice::new(i2c_bus))));
+    spawner.spawn(unwrap!(fuel::fuel_task(i2c_bus)));
 
     // Зелёный светодиод на GP25 — через R19 470R на землю, активен высоким.
     spawner.spawn(unwrap!(led::led_task(Output::new(p.PIN_25, Level::Low))));

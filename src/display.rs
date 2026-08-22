@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! ┌──────────────────────────────┐
-//! │ 12:34               ▁▃▅▇█    │  время крупно, шкала сигнала справа
+//! │ 12:34        85%    ▁▃▅▇█    │  время, заряд батареи, шкала сигнала
 //! │ 2026-08-16                   │
 //! │ Кредит 1.50                  │  накоплено монетоприёмником
 //! │ -73dBm MQTT + 0/2            │  обрывы: MQTT / канала
@@ -28,11 +28,18 @@
 //! прислала, вместо часов выводится «--:--»: показывать заводскую дату модема
 //! (2004 год) значило бы врать правдоподобно выглядящими цифрами.
 //!
+//! Заряд приходит от топливомера MAX17048 — см. [`crate::fuel`]. Шина у них
+//! общая, поэтому она за мьютексом. Если топливомера нет, вместо процентов
+//! стоит прочерк: пустое место читалось бы как «показа заряда тут не
+//! предусмотрено».
+//!
 //! Экран необязателен. Если по шине никто не отозвался, задача сообщает об
 //! этом в лог и засыпает: связь и телеметрия от наличия дисплея не зависят.
 
+use embassy_embedded_hal::shared_bus::asynch::i2c::I2cDevice;
 use embassy_rp::i2c::{Async, I2c};
 use embassy_rp::peripherals::I2C0;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::{Duration, Timer};
 use embedded_graphics::mono_font::MonoTextStyle;
 // Кириллический набор: шрифты `ascii` вместо русских букв рисуют заглушку.
@@ -48,6 +55,7 @@ use ssd1306::{I2CDisplayInterface, Ssd1306Async};
 use crate::clock;
 use crate::coin;
 use crate::coin_io;
+use crate::fuel;
 use crate::health;
 use crate::mqtt;
 
@@ -66,8 +74,14 @@ const BAR_GAP: i32 = 2;
 const BAR_BASELINE: i32 = 20;
 const BAR_RIGHT: i32 = 126;
 
+/// Где начинается заряд батареи: правее часов, левее шкалы сигнала.
+const BATTERY_X: i32 = 58;
+
+/// Шина у экрана общая с топливомером, отсюда обёртка вместо самой шины.
+type SharedI2c = I2cDevice<'static, CriticalSectionRawMutex, I2c<'static, I2C0, Async>>;
+
 type Display = Ssd1306Async<
-    I2CInterface<I2c<'static, I2C0, Async>>,
+    I2CInterface<SharedI2c>,
     DisplaySize128x64,
     BufferedGraphicsModeAsync<DisplaySize128x64>,
 >;
@@ -76,12 +90,16 @@ type Display = Ssd1306Async<
 ///
 /// Пробуем оба адреса: заводской и переставленный перемычкой. Возвращаем
 /// `None`, если не отозвался никто.
-async fn probe(mut i2c: I2c<'static, I2C0, Async>) -> Option<Display> {
+async fn probe(mut i2c: SharedI2c) -> Option<Display> {
     let mut found = None;
     for address in CANDIDATE_ADDRESSES {
         // Байт 0x00 — префикс потока команд; сам по себе он безвреден и годится
-        // как проверка присутствия.
-        if i2c.write_async(address, [0x00u8]).await.is_ok() {
+        // как проверка присутствия. Обращаемся через трейт: шина теперь за
+        // общей обёрткой, и собственных методов embassy-rp у неё нет.
+        if embedded_hal_async::i2c::I2c::write(&mut i2c, address, &[0x00u8])
+            .await
+            .is_ok()
+        {
             info!("OLED: найден по адресу 0x{:02x}", address);
             found = Some(address);
             break;
@@ -150,6 +168,25 @@ async fn render(display: &mut Display) {
     let _ = Text::new(&time, Point::new(2, 18), big).draw(display);
     let _ = Text::new(&date, Point::new(2, 32), small).draw(display);
 
+    // Заряд батареи — в просвет между часами и шкалой сигнала: единственное
+    // свободное место, все четыре строки заняты.
+    //
+    // Показываем проценты, а не вольты: оператору нужно решение «менять или
+    // нет», а не показание. Напряжение при этом идёт в лог — там оно как раз
+    // диагностическое, и по нему видно, врёт ли модель разряда.
+    let mut charge = heapless::String::<8>::new();
+    match fuel::percent() {
+        Some(pct) => {
+            let _ = core::fmt::Write::write_fmt(&mut charge, format_args!("{pct}%"));
+        }
+        // Прочерк, а не пустое место: так видно, что топливомер опрашивается и
+        // не отвечает, а не что показа заряда тут вовсе не предусмотрено.
+        None => {
+            let _ = core::fmt::Write::write_str(&mut charge, "--%");
+        }
+    }
+    let _ = Text::new(&charge, Point::new(BATTERY_X, 18), small).draw(display);
+
     // Уровень сигнала: шкала справа вверху.
     let rssi = mqtt::LAST_CSQ.load(core::sync::atomic::Ordering::Relaxed);
     draw_signal(display, clock::signal_bars(rssi));
@@ -206,7 +243,7 @@ async fn render(display: &mut Display) {
 
 /// Обновляет экран раз в секунду.
 #[embassy_executor::task]
-pub async fn display_task(i2c: I2c<'static, I2C0, Async>) -> ! {
+pub async fn display_task(i2c: SharedI2c) -> ! {
     let Some(mut display) = probe(i2c).await else {
         warn!("OLED: не отвечает ни 0x3C, ни 0x3D — экран не подключён?");
         // Задача обязана жить: возврат из неё освободит слот исполнителя лишь

@@ -1234,6 +1234,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "max170xx"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e36315dcf3785ab2b2806a1654e0b23c63e937b8c57a1a610098f2683da89366"
+dependencies = [
+ "embedded-hal 1.0.0",
+]
+
+[[package]]
 name = "maybe-async-cfg"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1653,6 +1662,7 @@ dependencies = [
  "cortex-m-rt",
  "defmt 1.1.1",
  "defmt-rtt",
+ "embassy-embedded-hal",
  "embassy-executor",
  "embassy-futures",
  "embassy-net",
@@ -1663,12 +1673,14 @@ dependencies = [
  "embassy-usb",
  "embassy-usb-logger",
  "embedded-graphics",
+ "embedded-hal-async",
  "embedded-io 0.6.1",
  "embedded-io 0.7.1",
  "embedded-io-async 0.6.1",
  "embedded-io-async 0.7.0",
  "heapless 0.9.3",
  "log",
+ "max170xx",
  "panic-probe",
  "portable-atomic",
  "rust-mqtt",

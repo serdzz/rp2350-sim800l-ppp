@@ -114,6 +114,9 @@ embedded-io-06 = { version = "0.6", package = "embedded-io" }
 embedded-io-async-06 = { version = "0.6", package = "embedded-io-async" }
 ssd1306 = { version = "0.10", default-features = false, features = ["async", "graphics"] }
 embedded-graphics = "0.8"
+max170xx = "1.0"
+embassy-embedded-hal = "0.6"
+embedded-hal-async = "1.0"
 
 [profile.release]
 debug = 2
