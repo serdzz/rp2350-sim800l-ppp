@@ -36,7 +36,7 @@ use embassy_rp::i2c::{Async, I2c};
 use embassy_rp::peripherals::I2C0;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::mutex::Mutex;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Timer, with_timeout};
 use max170xx::Max17048;
 
 /// Шина, разделяемая экраном и топливомером.
@@ -44,6 +44,20 @@ pub type I2cBus = Mutex<CriticalSectionRawMutex, I2c<'static, I2C0, Async>>;
 
 /// Как часто опрашивать. Заряд меняется медленно, чаще незачем.
 const POLL: Duration = Duration::from_secs(10);
+
+/// Адрес MAX17048 на шине. Крейт держит его внутри, а нам он нужен для
+/// проверки присутствия — см. [`fuel_task`].
+const ADDRESS: u8 = 0x36;
+
+/// Регистр версии: читать его безобидно, а записать один байт указателя —
+/// самая короткая транзакция, какой можно спросить «ты здесь?».
+const VERSION_REG: u8 = 0x08;
+
+/// Сколько ждать отклика на проверку присутствия.
+///
+/// Байт на 100 кГц уходит за сотню микросекунд, так что сто миллисекунд — это
+/// с тысячекратным запасом и всё равно незаметно.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Признак «показаний нет».
 ///
@@ -86,9 +100,30 @@ pub async fn fuel_task(bus: &'static I2cBus) -> ! {
         // ждать нас не должен.
         let reading = {
             let mut i2c = bus.lock().await;
-            let mut gauge = Max17048::new(&mut *i2c);
-            match (gauge.voltage(), gauge.soc()) {
-                (Ok(v), Ok(soc)) => Some((v, soc)),
+
+            // Сперва спрашиваем шину асинхронно и с таймаутом, и только потом
+            // отдаём её блокирующему крейту.
+            //
+            // Порядок именно такой не из аккуратности: блокирующий вызов
+            // нечем прервать. На залипшей шине он вешает задачу навсегда, а
+            // вместе с ней и мьютекс — то есть заодно и экран, которому эта
+            // шина тоже нужна. Проверка присутствия ограничивает риск: до
+            // блокирующего вызова дело доходит, только если устройство
+            // ответило.
+            let present = with_timeout(
+                PROBE_TIMEOUT,
+                embedded_hal_async::i2c::I2c::write(&mut *i2c, ADDRESS, &[VERSION_REG]),
+            )
+            .await;
+
+            match present {
+                Ok(Ok(())) => {
+                    let mut gauge = Max17048::new(&mut *i2c);
+                    match (gauge.voltage(), gauge.soc()) {
+                        (Ok(v), Ok(soc)) => Some((v, soc)),
+                        _ => None,
+                    }
+                }
                 _ => None,
             }
         };
