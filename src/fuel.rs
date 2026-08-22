@@ -75,7 +75,11 @@ pub fn percent() -> Option<u8> {
 /// Опрашивает топливомер и складывает показания в атомики.
 #[embassy_executor::task]
 pub async fn fuel_task(bus: &'static I2cBus) -> ! {
-    let mut announced = false;
+    // `None` до первого опроса. Три состояния, а не два, потому что молчание
+    // датчика с самого включения — тоже новость, и о ней надо сказать. Флаг
+    // из двух состояний её проглатывал: не отвечал — значит и «перестал
+    // отвечать» печатать не о чем, и в логе не было ни строчки.
+    let mut answering: Option<bool> = None;
 
     loop {
         // Мьютекс держим только на время обмена: экран рисует раз в секунду и
@@ -91,9 +95,9 @@ pub async fn fuel_task(bus: &'static I2cBus) -> ! {
 
         match reading {
             Some((volts, soc)) => {
-                if !announced {
+                if answering != Some(true) {
                     info!("FUEL: MAX17048 отвечает");
-                    announced = true;
+                    answering = Some(true);
                 }
                 PERMILLE.store((soc * 10.0).clamp(0.0, 1000.0) as u16, Ordering::Relaxed);
                 info!(
@@ -106,10 +110,14 @@ pub async fn fuel_task(bus: &'static I2cBus) -> ! {
                 // Показание стираем, а не оставляем последнее: устаревшие
                 // проценты на экране хуже честного прочерка.
                 PERMILLE.store(NO_READING, Ordering::Relaxed);
-                if announced {
-                    warn!("FUEL: MAX17048 перестал отвечать");
-                    announced = false;
+                match answering {
+                    None => warn!(
+                        "FUEL: MAX17048 не отвечает по адресу 0x36 — подключён ли к GP16/GP17?"
+                    ),
+                    Some(true) => warn!("FUEL: MAX17048 перестал отвечать"),
+                    Some(false) => {}
                 }
+                answering = Some(false);
             }
         }
 
